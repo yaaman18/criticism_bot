@@ -1,0 +1,60 @@
+[
+  {
+    "id": "active_inference_and_learning_2016",
+    "title": "Active inference and learning",
+    "source": "City Research Online accepted manuscript",
+    "status": "downloaded",
+    "path": "papers/active_inference_and_learning_2016.pdf"
+  },
+  {
+    "id": "pymdp_2022",
+    "title": "pymdp: A Python library for active inference in discrete state spaces",
+    "source": "JOSS",
+    "status": "downloaded",
+    "path": "papers/pymdp_2022.pdf"
+  },
+  {
+    "id": "deep_active_inference_2017",
+    "title": "Deep Active Inference",
+    "source": "arXiv",
+    "status": "downloaded",
+    "path": "papers/deep_active_inference_2017.pdf"
+  },
+  {
+    "id": "markov_blankets_of_life_2018",
+    "title": "The Markov blankets of life: autonomy, active inference and the free energy principle",
+    "source": "PhilPapers mirror / PMC HTML mirror",
+    "status": "downloaded",
+    "path": "papers/markov_blankets_of_life_2018.pdf",
+    "html_mirror": "papers/markov_blankets_of_life_2018.html"
+  },
+  {
+    "id": "life_as_we_know_it_2013",
+    "title": "Life as we know it",
+    "source": "UCL",
+    "status": "downloaded",
+    "path": "papers/life_as_we_know_it_2013.pdf"
+  },
+  {
+    "id": "active_inference_homeostatic_regulation_2015",
+    "title": "Active Inference, homeostatic regulation and adaptive behavioural control",
+    "source": "City Research Online / PMC HTML mirror",
+    "status": "downloaded",
+    "path": "papers/active_inference_homeostatic_regulation_2015.pdf",
+    "html_mirror": "papers/active_inference_homeostatic_regulation_2015.html"
+  },
+  {
+    "id": "allostasis_interoception_2016",
+    "title": "An active inference theory of allostasis and interoception in depression",
+    "source": "Affective Science",
+    "status": "downloaded",
+    "path": "papers/allostasis_interoception_2016.pdf"
+  },
+  {
+    "id": "protocell_models_2015",
+    "title": "Protocells Models in Origin of Life and Synthetic Biology",
+    "source": "MDPI / alternate mirrors",
+    "status": "failed",
+    "error": "Open PDF URL attempts returned 403 or 404; article remains unresolved in this pass."
+  }
+]

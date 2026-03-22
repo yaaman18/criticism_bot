@@ -1,0 +1,47 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.crt
+*.cer
+*.der
+*.kdbx
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+
+# Large local research/source documents
+*.pdf
+
+# Generated experiment outputs and model artifacts
+artifacts/
+data/trm_*/
+*.npz
+*.pt
+
+# Local runtime files
+.streamlit_ui.pid
+streamlit.log
+*.log
+
+# Test and coverage artifacts
+.coverage
+.pytest_cache/
+
+# OS-generated files
+.DS_Store

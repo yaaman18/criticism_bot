@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+.mypy_cache
+.coverage
+artifacts
+data/trm_rollouts*
+data/trm_b_cache*
+data/trm_va_cache*
+exports
+papers
+pdf
