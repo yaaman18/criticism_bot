@@ -4,12 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
-if [[ ! -d .venv ]]; then
-  echo "Error: .venv not found. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
+STREAMLIT_BIN="$ROOT_DIR/.venv/bin/streamlit"
+
+if [[ ! -x "$STREAMLIT_BIN" ]]; then
+  echo "Error: repo virtualenv is missing or incomplete. Run: ./scripts/bootstrap_env.sh" >&2
   exit 1
 fi
-
-source .venv/bin/activate
 
 PORT="${1:-8501}"
 PID_FILE=".streamlit_ui.pid"
@@ -26,7 +26,7 @@ if [[ -f "$PID_FILE" ]]; then
   fi
 fi
 
-nohup streamlit run chat_ui.py --server.port "$PORT" --server.headless true > "$LOG_FILE" 2>&1 &
+nohup "$STREAMLIT_BIN" run chat_ui.py --server.port "$PORT" --server.headless true > "$LOG_FILE" 2>&1 &
 NEW_PID=$!
 echo "$NEW_PID" > "$PID_FILE"
 

@@ -148,5 +148,8 @@ def test_generate_rollouts_writes_manifest_and_summary(tmp_path: Path) -> None:
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["num_selected_seeds"] == 3
     assert summary["num_successful_episodes"] == len(rows)
+    assert "regime_counts" in summary
+    assert "perturb_counts" in summary
+    assert "mu_range" in summary
     first_path = Path(rows[0]["path"])
     assert first_path.exists()

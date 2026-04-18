@@ -46,14 +46,38 @@ def _life_rgb(env_channels_t: np.ndarray) -> np.ndarray:
 
 
 def _field_rgb(env_channels_t: np.ndarray) -> np.ndarray:
-    resource = env_channels_t[..., 5]
-    hazard = env_channels_t[..., 6]
-    shelter = env_channels_t[..., 7]
+    energy = env_channels_t[..., 5]
+    thermal = env_channels_t[..., 6]
+    toxicity = env_channels_t[..., 7]
+    niche = env_channels_t[..., 8]
     rgb = np.stack(
         [
-            _clip01(0.95 * hazard + 0.15 * resource),
-            _clip01(0.85 * resource + 0.20 * shelter),
-            _clip01(0.90 * shelter + 0.10 * resource),
+            _clip01(0.70 * thermal + 0.40 * toxicity + 0.15 * energy),
+            _clip01(0.80 * energy + 0.25 * niche),
+            _clip01(0.90 * niche + 0.20 * thermal),
+        ],
+        axis=-1,
+    )
+    return rgb.astype(np.float32)
+
+
+def _species_rgb(species_sources_t: np.ndarray, species_fields_t: np.ndarray | None = None) -> np.ndarray:
+    energy_src = species_sources_t[..., 0]
+    toxic_src = species_sources_t[..., 1]
+    niche_src = species_sources_t[..., 2]
+    if species_fields_t is None:
+        thermal = toxic_src
+        toxicity = toxic_src
+        niche_field = niche_src
+    else:
+        thermal = species_fields_t[..., 1]
+        toxicity = species_fields_t[..., 2]
+        niche_field = species_fields_t[..., 3]
+    rgb = np.stack(
+        [
+            _clip01(0.85 * toxic_src + 0.20 * thermal),
+            _clip01(0.80 * energy_src + 0.15 * niche_field),
+            _clip01(0.85 * niche_src + 0.15 * toxicity),
         ],
         axis=-1,
     )
@@ -105,6 +129,8 @@ def export_openframeworks_frames(npz_path: str | Path, output_root: str | Path) 
     env_channels = data["env_channels"]
     world_logvar = data["world_logvar"]
     boundary_logvar = data["boundary_logvar"]
+    species_sources = data["species_sources"] if "species_sources" in data.files else None
+    species_fields = data["species_fields"] if "species_fields" in data.files else None
 
     frame_count, height, width = occupancy.shape
     manifest_frames: list[dict[str, Any]] = []
@@ -115,15 +141,24 @@ def export_openframeworks_frames(npz_path: str | Path, output_root: str | Path) 
         field_rgb = _field_rgb(env_channels[idx])
         body_rgb = _body_rgb(occupancy[idx], boundary[idx], permeability[idx])
         aura_rgb = _aura_rgb(world_logvar[idx], boundary_logvar[idx])
+        species_rgb = None
+        if species_sources is not None:
+            species_rgb = _species_rgb(
+                species_sources[idx],
+                species_fields[idx] if species_fields is not None else None,
+            )
 
         life_path = frames_dir / f"life_{stem}.png"
         field_path = frames_dir / f"field_{stem}.png"
         body_path = frames_dir / f"body_{stem}.png"
         aura_path = frames_dir / f"aura_{stem}.png"
+        species_path = frames_dir / f"species_{stem}.png"
         _save_png(life_path, life_rgb)
         _save_png(field_path, field_rgb)
         _save_png(body_path, body_rgb)
         _save_png(aura_path, aura_rgb)
+        if species_rgb is not None:
+            _save_png(species_path, species_rgb)
         manifest_frames.append(
             {
                 "index": idx,
@@ -131,6 +166,7 @@ def export_openframeworks_frames(npz_path: str | Path, output_root: str | Path) 
                 "field": str(field_path.relative_to(output_root)),
                 "body": str(body_path.relative_to(output_root)),
                 "aura": str(aura_path.relative_to(output_root)),
+                "species": str(species_path.relative_to(output_root)) if species_rgb is not None else None,
             }
         )
 

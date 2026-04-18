@@ -60,6 +60,38 @@ def _manifest(tmp_path: Path) -> Path:
     return manifest_path
 
 
+def _multispecies_manifest(tmp_path: Path) -> Path:
+    manifest_path = tmp_path / "manifest_multispecies.jsonl"
+    rows = []
+    rng = np.random.default_rng(42)
+    for split, episode_id in (("train", "ep_train_multi"), ("val", "ep_val_multi")):
+        wp_input_view = rng.random((10, 32, 32, 18), dtype=np.float32)
+        wp_target_observation = rng.random((10, 32, 32, 11), dtype=np.float32)
+        wp_observation = np.clip(wp_target_observation + 0.05, 0.0, 1.0).astype(np.float32)
+        path = tmp_path / f"{episode_id}.npz"
+        np.savez_compressed(
+            path,
+            wp_input_view=wp_input_view,
+            wp_target_observation=wp_target_observation,
+            wp_observation=wp_observation,
+        )
+        rows.append(
+            {
+                "episode_id": episode_id,
+                "split": split,
+                "path": str(path),
+                "num_samples": int(wp_input_view.shape[0]),
+                "seed_id": f"seed_{episode_id}",
+                "regime": "stable",
+            }
+        )
+    manifest_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
 def _small_model_config() -> TRMModelConfig:
     return TRMModelConfig(
         image_size=32,
@@ -134,6 +166,50 @@ def test_evaluate_trm_a_runs_on_small_manifest(tmp_path: Path) -> None:
     }
     assert np.isfinite(metrics["val_nmse"])
     assert np.isfinite(metrics["rollout_nmse_8"])
+
+
+def test_train_trm_a_multispecies_wp_view_smoke(tmp_path: Path) -> None:
+    manifest_path = _multispecies_manifest(tmp_path)
+    output_dir = tmp_path / "trm_a_wp_out"
+
+    train(
+        manifest_path=manifest_path,
+        output_dir=output_dir,
+        model_config=TRMModelConfig(
+            image_size=32,
+            patch_size=8,
+            dim=32,
+            recursions=2,
+            num_heads=4,
+            mlp_ratio=2,
+            in_channels=18,
+            out_channels=11,
+            z_dim=8,
+            max_params=7_000_000,
+        ),
+        train_config=TrainConfig(
+            batch_size=2,
+            epochs=1,
+            learning_rate=1e-4,
+            objective="gaussian_nll",
+            max_val_rollout_episodes=1,
+        ),
+        root_seed=123,
+        input_key="wp_input_view",
+        target_key="wp_target_observation",
+        baseline_key="wp_observation",
+        use_amp=True,
+        log_interval=1,
+    )
+
+    metrics = json.loads((output_dir / "trm_a_metrics_latest.json").read_text(encoding="utf-8"))
+    summary = json.loads((output_dir / "trm_a_summary.json").read_text(encoding="utf-8"))
+    assert np.isfinite(metrics["val_nmse"])
+    assert np.isfinite(metrics["baseline_nmse"])
+    assert np.isnan(metrics["rollout_nmse_8"])
+    assert summary["input_key"] == "wp_input_view"
+    assert summary["target_key"] == "wp_target_observation"
+    assert summary["baseline_key"] == "wp_observation"
 
 
 def test_train_trm_a_smoke_writes_checkpoint_and_metrics(tmp_path: Path) -> None:

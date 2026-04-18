@@ -14,6 +14,7 @@ from trm_pipeline.erie_runtime import (
     BodyState,
     ERIERuntime,
     EnvironmentConfig,
+    ExternalState,
     LeniaERIEEnvironment,
     RuntimeModels,
     RuntimeConfig,
@@ -90,7 +91,17 @@ def _configure_controlled_resource_corridor(runtime: ERIERuntime) -> ERIERuntime
     runtime.env.environment_channels = lambda: np.concatenate(
         [
             np.zeros((32, 32, 5), dtype=np.float32),
-            np.stack([runtime.env.resource, runtime.env.hazard, runtime.env.shelter], axis=-1),
+            np.stack(
+                [
+                    runtime.env.energy_gradient,
+                    runtime.env.thermal_stress,
+                    runtime.env.toxicity,
+                    runtime.env.niche_stability,
+                    runtime.env.flow_y,
+                    runtime.env.flow_x,
+                ],
+                axis=-1,
+            ),
         ],
         axis=-1,
     )
@@ -125,7 +136,17 @@ def _configure_controlled_hazard_escape(runtime: ERIERuntime) -> ERIERuntime:
     runtime.env.environment_channels = lambda: np.concatenate(
         [
             np.zeros((32, 32, 5), dtype=np.float32),
-            np.stack([runtime.env.resource, runtime.env.hazard, runtime.env.shelter], axis=-1),
+            np.stack(
+                [
+                    runtime.env.energy_gradient,
+                    runtime.env.thermal_stress,
+                    runtime.env.toxicity,
+                    runtime.env.niche_stability,
+                    runtime.env.flow_y,
+                    runtime.env.flow_x,
+                ],
+                axis=-1,
+            ),
         ],
         axis=-1,
     )
@@ -170,6 +191,46 @@ def test_softmax_is_normalized() -> None:
     assert probs.shape == (3,)
     assert np.isclose(float(probs.sum()), 1.0)
     assert np.all(probs > 0.0)
+
+
+def test_external_state_channels_stack_lenia_and_fields() -> None:
+    external = ExternalState(
+        scalar_state=np.ones((4, 4), dtype=np.float32),
+        prev_scalar_state=np.zeros((4, 4), dtype=np.float32),
+        species_energy_state=np.full((4, 4), 0.15, dtype=np.float32),
+        species_toxic_state=np.full((4, 4), 0.25, dtype=np.float32),
+        species_niche_state=np.full((4, 4), 0.35, dtype=np.float32),
+        energy_gradient=np.full((4, 4), 0.1, dtype=np.float32),
+        thermal_stress=np.full((4, 4), 0.2, dtype=np.float32),
+        toxicity=np.full((4, 4), 0.3, dtype=np.float32),
+        niche_stability=np.full((4, 4), 0.4, dtype=np.float32),
+        flow_y=np.full((4, 4), -0.15, dtype=np.float32),
+        flow_x=np.full((4, 4), 0.25, dtype=np.float32),
+    )
+    channels = external.as_channels({"m": 0.3, "s": 0.05})
+    assert channels.shape == (4, 4, 11)
+    np.testing.assert_allclose(channels[..., 5], 0.1)
+    np.testing.assert_allclose(channels[..., 6], 0.2)
+    np.testing.assert_allclose(channels[..., 7], 0.3)
+    np.testing.assert_allclose(channels[..., 8], 0.4)
+    np.testing.assert_allclose(channels[..., 9], -0.15)
+    np.testing.assert_allclose(channels[..., 10], 0.25)
+    external_channels = external.as_external_channels(
+        {"m": 0.3, "s": 0.05},
+        {
+            "species_energy": {"m": 0.28, "s": 0.05},
+            "species_toxic": {"m": 0.31, "s": 0.06},
+            "species_niche": {"m": 0.26, "s": 0.04},
+        },
+    )
+    assert external_channels.shape == (4, 4, 26)
+    np.testing.assert_allclose(external_channels[..., 20], 0.1)
+    np.testing.assert_allclose(external_channels[..., 25], 0.25)
+    sources = external.species_sources()
+    assert sources.shape == (4, 4, 3)
+    np.testing.assert_allclose(sources[..., 0], 0.15)
+    np.testing.assert_allclose(sources[..., 1], 0.25)
+    np.testing.assert_allclose(sources[..., 2], 0.35)
 
 
 def test_body_fields_have_expected_ranges() -> None:
@@ -231,10 +292,59 @@ def test_step_respects_random_policy_mode() -> None:
     assert runtime.history[-1]["action"] in ACTIONS
 
 
+def test_environment_properties_alias_external_state() -> None:
+    runtime = _runtime()
+    env = runtime.env
+    np.testing.assert_allclose(env.species_energy_state, env.external_state.species_energy_state)
+    np.testing.assert_allclose(env.species_toxic_state, env.external_state.species_toxic_state)
+    np.testing.assert_allclose(env.species_niche_state, env.external_state.species_niche_state)
+    np.testing.assert_allclose(env.energy_gradient, env.external_state.energy_gradient)
+    np.testing.assert_allclose(env.thermal_stress, env.external_state.thermal_stress)
+    np.testing.assert_allclose(env.toxicity, env.external_state.toxicity)
+    np.testing.assert_allclose(env.niche_stability, env.external_state.niche_stability)
+    np.testing.assert_allclose(env.flow_y, env.external_state.flow_y)
+    np.testing.assert_allclose(env.flow_x, env.external_state.flow_x)
+
+    env.energy_gradient = np.full_like(env.energy_gradient, 0.33)
+    env.thermal_stress = np.full_like(env.thermal_stress, 0.44)
+    env.toxicity = np.full_like(env.toxicity, 0.55)
+    env.niche_stability = np.full_like(env.niche_stability, 0.66)
+    env.species_energy_state = np.full_like(env.species_energy_state, 0.11)
+    env.species_toxic_state = np.full_like(env.species_toxic_state, 0.22)
+    env.species_niche_state = np.full_like(env.species_niche_state, 0.33)
+    env.flow_y = np.full_like(env.flow_y, -0.12)
+    env.flow_x = np.full_like(env.flow_x, 0.18)
+
+    np.testing.assert_allclose(env.external_state.species_energy_state, 0.11)
+    np.testing.assert_allclose(env.external_state.species_toxic_state, 0.22)
+    np.testing.assert_allclose(env.external_state.species_niche_state, 0.33)
+    np.testing.assert_allclose(env.external_state.energy_gradient, 0.33)
+    np.testing.assert_allclose(env.external_state.thermal_stress, 0.44)
+    np.testing.assert_allclose(env.external_state.toxicity, 0.55)
+    np.testing.assert_allclose(env.external_state.niche_stability, 0.66)
+    np.testing.assert_allclose(env.external_state.flow_y, -0.12)
+    np.testing.assert_allclose(env.external_state.flow_x, 0.18)
+
+
+def test_advance_external_state_updates_lenia_and_fields() -> None:
+    runtime = _runtime()
+    env = runtime.env
+    body = runtime.body
+    old_scalar = env.scalar_state.copy()
+    old_species_energy = env.species_energy_state.copy()
+    old_energy = env.energy_gradient.copy()
+    old_toxicity = env.toxicity.copy()
+    env.advance_external_state(body, "intake")
+    assert not np.allclose(env.scalar_state, old_scalar)
+    assert not np.allclose(env.species_energy_state, old_species_energy)
+    assert not np.allclose(env.energy_gradient, old_energy)
+    assert not np.allclose(env.toxicity, old_toxicity)
+
+
 def test_observe_blends_environment_through_boundary_interface(monkeypatch) -> None:
     runtime = _runtime()
     runtime.world_belief.fill(0.0)
-    runtime.env.environment_channels = lambda: np.ones((32, 32, 8), dtype=np.float32)
+    runtime.env.environment_channels = lambda: np.ones((32, 32, 11), dtype=np.float32)
     monkeypatch.setattr(
         erie_runtime_module,
         "gaussian_noise",
@@ -243,11 +353,66 @@ def test_observe_blends_environment_through_boundary_interface(monkeypatch) -> N
 
     observation, sensor_gate, occupancy, boundary = runtime._observe()
 
-    assert observation.shape == (32, 32, 8)
+    assert observation.shape == (32, 32, 11)
     assert sensor_gate.shape == (32, 32, 1)
     assert float(sensor_gate.max()) > float(sensor_gate.min())
     assert np.allclose(observation, np.broadcast_to(sensor_gate, observation.shape), atol=1e-6)
     assert float(boundary.max()) > float(occupancy.min())
+
+
+def test_snapshot_contains_external_state_and_observation(monkeypatch) -> None:
+    runtime = _runtime()
+    monkeypatch.setattr(
+        erie_runtime_module,
+        "gaussian_noise",
+        lambda rng, shape, sigma: np.zeros(shape, dtype=np.float32),
+    )
+    runtime.step(0)
+    frame = runtime.snapshot()
+    assert "external_state" in frame
+    assert "species_sources" in frame
+    assert "species_fields" in frame
+    assert "observation" in frame
+    assert "sensor_gate" in frame
+    assert "world_error" in frame
+    assert "boundary_error" in frame
+    assert frame["external_state"].shape == (32, 32, 26)
+    assert frame["species_sources"].shape == (32, 32, 3)
+    assert frame["species_fields"].shape == (32, 32, 4)
+    assert frame["observation"].shape == (32, 32, 11)
+    assert frame["sensor_gate"].shape == (32, 32, 1)
+    assert frame["world_error"].shape == (32, 32, 11)
+    assert frame["boundary_error"].shape == (32, 32, 2)
+
+
+def test_observation_mapping_noise_scale_tracks_stress_and_niche(monkeypatch) -> None:
+    runtime = _runtime()
+    occupancy, _, permeability = runtime._body_fields()
+    env_channels = runtime.env.environment_channels()
+    sensor_gate = np.clip(permeability[..., None] + 0.05 * occupancy[..., None], 0.0, 1.0)
+    monkeypatch.setattr(
+        erie_runtime_module,
+        "gaussian_noise",
+        lambda rng, shape, sigma: np.zeros(shape, dtype=np.float32),
+    )
+
+    low_noise = runtime._observation_mapping(
+        env_channels=env_channels,
+        sensor_gate=sensor_gate,
+        thermal_stress=np.zeros_like(runtime.env.thermal_stress, dtype=np.float32),
+        toxicity=np.zeros_like(runtime.env.toxicity, dtype=np.float32),
+        niche_stability=np.ones_like(runtime.env.niche_stability, dtype=np.float32),
+    )
+    high_noise = runtime._observation_mapping(
+        env_channels=env_channels,
+        sensor_gate=sensor_gate,
+        thermal_stress=np.ones_like(runtime.env.thermal_stress, dtype=np.float32),
+        toxicity=np.ones_like(runtime.env.toxicity, dtype=np.float32),
+        niche_stability=np.zeros_like(runtime.env.niche_stability, dtype=np.float32),
+    )
+
+    assert float(high_noise["noise_scale"].mean()) > float(low_noise["noise_scale"].mean())
+    assert high_noise["observation"].shape == env_channels.shape
 
 
 def test_belief_update_matches_precision_weighted_error_rule() -> None:
@@ -266,6 +431,27 @@ def test_belief_update_matches_precision_weighted_error_rule() -> None:
     assert np.allclose(runtime.boundary_belief, runtime.cfg.lambda_b, atol=1e-6)
     assert np.allclose(runtime.world_logvar, runtime.cfg.world_logvar_drift - 0.18, atol=1e-6)
     assert np.allclose(runtime.boundary_logvar, runtime.cfg.boundary_logvar_drift - 0.20, atol=1e-6)
+
+
+def test_belief_update_records_vfe_components() -> None:
+    runtime = _runtime()
+    runtime.world_belief.fill(0.2)
+    runtime.world_logvar.fill(0.0)
+    runtime.boundary_belief.fill(0.1)
+    runtime.boundary_logvar.fill(0.0)
+    observation = np.ones_like(runtime.world_belief, dtype=np.float32) * 0.8
+    sensor_gate = np.ones((*runtime.world_belief.shape[:2], 1), dtype=np.float32)
+    boundary_obs = np.ones_like(runtime.boundary_belief, dtype=np.float32) * 0.9
+
+    runtime._belief_update(observation, sensor_gate, boundary_obs)
+
+    assert runtime.last_vfe["world_reconstruction"] > 0.0
+    assert runtime.last_vfe["boundary_reconstruction"] > 0.0
+    assert runtime.last_vfe["world_complexity"] > 0.0
+    assert runtime.last_vfe["boundary_complexity"] > 0.0
+    assert runtime.last_vfe["world"] > 0.0
+    assert runtime.last_vfe["boundary"] > 0.0
+    assert runtime.last_vfe["total"] >= runtime.last_vfe["world"] + runtime.last_vfe["boundary"] - 1e-8
 
 
 def test_lower_logvar_produces_larger_belief_update() -> None:
@@ -338,6 +524,29 @@ def test_policy_scores_prefer_withdraw_under_high_hazard_and_low_boundary() -> N
     assert diagnostics["seal"]["risk"] < diagnostics["approach"]["risk"]
     assert best_action in {"withdraw", "seal", "reconfigure"}
     assert score_map[best_action] < score_map["approach"]
+
+
+def test_step_history_contains_vfe_and_efe_logs() -> None:
+    runtime = _runtime()
+    runtime.step(0)
+    row = runtime.history[-1]
+
+    assert "vfe_world" in row
+    assert "vfe_boundary" in row
+    assert "vfe_total" in row
+    assert "efe_selected" in row
+    assert "efe_selected_risk" in row
+    assert "efe_selected_ambiguity" in row
+    assert "efe_selected_epistemic" in row
+    assert row["vfe_total"] >= row["vfe_world"] + row["vfe_boundary"] - 1e-8
+
+
+def test_external_channels_include_multispecies_sources() -> None:
+    runtime = _runtime()
+    channels = runtime.env.external_channels()
+
+    assert channels.shape == (32, 32, 26)
+    assert float(channels[..., 5:20].std()) > 0.0
 
 
 def test_risk_proxy_prefers_homeostatic_band_over_safe_overshoot() -> None:
@@ -524,7 +733,7 @@ def test_select_policy_uses_primary_trm_as_residual_logits_when_available() -> N
     torch, _, _ = require_torch()
 
     class FakeActionScorer:
-        def __call__(self, viability_state, action_scores, uncertainty_state):
+        def __call__(self, viability_state, action_scores, uncertainty_state, env_contact_state=None, species_contact_state=None):
             batch = action_scores.shape[0]
             logits = torch.tensor([[-2.0, -2.0, -2.0, 4.0, -2.0]], dtype=torch.float32).repeat(batch, 1)
             return {
@@ -578,7 +787,7 @@ def test_select_policy_analytic_mode_ignores_trm_as() -> None:
     torch, _, _ = require_torch()
 
     class FakeActionScorer:
-        def __call__(self, viability_state, action_scores, uncertainty_state):
+        def __call__(self, viability_state, action_scores, uncertainty_state, env_contact_state=None, species_contact_state=None):
             batch = action_scores.shape[0]
             logits = torch.tensor([[9.0, -9.0, -9.0, -9.0, -9.0]], dtype=torch.float32).repeat(batch, 1)
             return {
@@ -614,7 +823,7 @@ def test_select_policy_module_primary_uses_trm_as_logits_directly() -> None:
     torch, _, _ = require_torch()
 
     class FakeActionScorer:
-        def __call__(self, viability_state, action_scores, uncertainty_state):
+        def __call__(self, viability_state, action_scores, uncertainty_state, env_contact_state=None, species_contact_state=None):
             batch = action_scores.shape[0]
             logits = torch.tensor([[-2.0, -2.0, 5.0, -2.0, -2.0]], dtype=torch.float32).repeat(batch, 1)
             return {
@@ -644,6 +853,746 @@ def test_select_policy_module_primary_uses_trm_as_logits_directly() -> None:
     assert diagnostics["source"] == "trm_as_primary"
     assert action == "intake"
     assert float(policy[ACTIONS.index("intake")]) > 0.98
+
+
+def test_select_policy_uses_trm_mc_context_bias_with_trm_as() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeActionScorer:
+        def __call__(self, viability_state, action_scores, uncertainty_state, env_contact_state=None, species_contact_state=None):
+            batch = action_scores.shape[0]
+            logits = torch.tensor([[3.0, -2.0, -2.0, -2.0, -1.0]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "action_state": torch.ones((batch, 32), dtype=torch.float32),
+                "policy_logits": logits,
+                "policy_prob": torch.softmax(logits, dim=-1),
+                "action_uncertainty": torch.full((batch, 5), 0.1, dtype=torch.float32),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+            }
+
+    class FakeMemoryContext:
+        def __call__(self, input_view, window_mask=None):
+            batch = input_view.shape[0]
+            sequence_bias = torch.tensor([[-2.0, -2.0, -2.0, -2.0, 5.0]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "context_state": torch.ones((batch, 32), dtype=torch.float32),
+                "retrieved_context": torch.zeros((batch, 44), dtype=torch.float32),
+                "sequence_bias": sequence_bias,
+                "boundary_control_bias": torch.zeros((batch, 3), dtype=torch.float32),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+                "context_uncertainty": torch.zeros((batch,), dtype=torch.float32),
+                "window_lengths": torch.full((batch,), 1.0, dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "action_mode": "assistive",
+            "context_memory_mode": "assistive",
+            "context_memory_residual_scale": 2.5,
+        }
+    )
+    runtime.models = SimpleNamespace(
+        trm_a=None,
+        trm_b=None,
+        trm_vm=None,
+        trm_as=FakeActionScorer(),
+        trm_mc=FakeMemoryContext(),
+        torch=torch,
+    )
+    scores = np.array([0.25, 0.3, 0.32, 0.35, 0.28], dtype=np.float32)
+    score_diag = {action: {"risk": float(scores[i]), "ambiguity": 0.0, "epistemic": 0.0, "pred_G": 0.5, "pred_B": 0.5, "death_risk": 0.0, "contact_risk": 0.0} for i, action in enumerate(ACTIONS)}
+    viability = {
+        "state": np.array([0.55, 0.65], dtype=np.float32),
+        "risk": 0.1,
+        "precision": 1.0,
+        "homeostatic_error": 0.0,
+        "homeostatic_error_vector": np.array([0.0, 0.0], dtype=np.float32),
+        "source": "analytic",
+    }
+
+    policy, action, diagnostics = runtime._select_policy(scores, score_diag, viability)
+
+    assert diagnostics["source"] == "trm_as"
+    assert diagnostics["context_source"] == "trm_mc"
+    assert action == "reconfigure"
+    assert float(policy[ACTIONS.index("reconfigure")]) > float(policy[ACTIONS.index("approach")])
+
+
+def test_select_policy_context_memory_analytic_mode_ignores_trm_mc() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeActionScorer:
+        def __call__(self, viability_state, action_scores, uncertainty_state, env_contact_state=None, species_contact_state=None):
+            batch = action_scores.shape[0]
+            logits = torch.tensor([[4.0, -2.0, -2.0, -2.0, -2.0]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "action_state": torch.ones((batch, 32), dtype=torch.float32),
+                "policy_logits": logits,
+                "policy_prob": torch.softmax(logits, dim=-1),
+                "action_uncertainty": torch.full((batch, 5), 0.1, dtype=torch.float32),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+            }
+
+    class FakeMemoryContext:
+        def __call__(self, input_view, window_mask=None):
+            batch = input_view.shape[0]
+            sequence_bias = torch.tensor([[-2.0, 5.0, -2.0, -2.0, -2.0]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "context_state": torch.ones((batch, 32), dtype=torch.float32),
+                "retrieved_context": torch.zeros((batch, 44), dtype=torch.float32),
+                "sequence_bias": sequence_bias,
+                "boundary_control_bias": torch.zeros((batch, 3), dtype=torch.float32),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+                "context_uncertainty": torch.zeros((batch,), dtype=torch.float32),
+                "window_lengths": torch.full((batch,), 1.0, dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "action_mode": "assistive",
+            "context_memory_mode": "analytic",
+            "context_memory_residual_scale": 4.0,
+        }
+    )
+    runtime.models = SimpleNamespace(
+        trm_a=None,
+        trm_b=None,
+        trm_vm=None,
+        trm_as=FakeActionScorer(),
+        trm_mc=FakeMemoryContext(),
+        torch=torch,
+    )
+    scores = np.array([0.2, 0.3, 0.32, 0.35, 0.28], dtype=np.float32)
+    score_diag = {action: {"risk": float(scores[i]), "ambiguity": 0.0, "epistemic": 0.0, "pred_G": 0.5, "pred_B": 0.5, "death_risk": 0.0, "contact_risk": 0.0} for i, action in enumerate(ACTIONS)}
+    viability = {
+        "state": np.array([0.55, 0.65], dtype=np.float32),
+        "risk": 0.1,
+        "precision": 1.0,
+        "homeostatic_error": 0.0,
+        "homeostatic_error_vector": np.array([0.0, 0.0], dtype=np.float32),
+        "source": "analytic",
+    }
+
+    policy, action, diagnostics = runtime._select_policy(scores, score_diag, viability)
+
+    assert diagnostics["source"] == "trm_as"
+    assert diagnostics["context_source"] == "analytic"
+    assert action == "approach"
+
+
+def test_select_policy_uses_trm_ag_to_inhibit_unsafe_action() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeActionScorer:
+        def __call__(self, viability_state, action_scores, uncertainty_state, env_contact_state=None, species_contact_state=None):
+            batch = action_scores.shape[0]
+            logits = torch.tensor([[4.0, -2.0, 3.0, -2.0, -2.0]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "action_state": torch.ones((batch, 32), dtype=torch.float32),
+                "policy_logits": logits,
+                "policy_prob": torch.softmax(logits, dim=-1),
+                "action_uncertainty": torch.full((batch, 5), 0.1, dtype=torch.float32),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+            }
+
+    class FakeActionGating:
+        def __call__(self, input_view):
+            batch = input_view.shape[0]
+            gated = torch.tensor([[-3.0, 1.5, 0.5, 0.5, 0.5]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "gating_state": torch.ones((batch, 32), dtype=torch.float32),
+                "gating_logits": torch.zeros((batch, 5), dtype=torch.float32),
+                "gated_policy_logits": gated,
+                "inhibition_mask": torch.tensor([[1.0, 0.0, 0.1, 0.1, 0.1]], dtype=torch.float32).repeat(batch, 1),
+                "control_mode_logits": torch.tensor([[-1.0, -1.0, 3.0]], dtype=torch.float32).repeat(batch, 1),
+                "control_mode_prob": torch.softmax(torch.tensor([[-1.0, -1.0, 3.0]], dtype=torch.float32), dim=-1).repeat(batch, 1),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "action_mode": "assistive",
+            "action_gating_mode": "assistive",
+            "context_memory_mode": "analytic",
+            "action_gating_blend": 1.0,
+        }
+    )
+    runtime.models = SimpleNamespace(
+        trm_a=None,
+        trm_b=None,
+        trm_vm=None,
+        trm_as=FakeActionScorer(),
+        trm_ag=FakeActionGating(),
+        trm_mc=None,
+        torch=torch,
+    )
+    scores = np.array([0.2, 0.3, 0.32, 0.35, 0.28], dtype=np.float32)
+    score_diag = {action: {"risk": float(scores[i]), "ambiguity": 0.0, "epistemic": 0.0, "pred_G": 0.5, "pred_B": 0.5, "death_risk": 0.0, "contact_risk": 0.0} for i, action in enumerate(ACTIONS)}
+    viability = {
+        "state": np.array([0.55, 0.65], dtype=np.float32),
+        "risk": 0.4,
+        "precision": 1.0,
+        "homeostatic_error": 0.1,
+        "homeostatic_error_vector": np.array([0.1, 0.0], dtype=np.float32),
+        "source": "analytic",
+    }
+
+    policy, action, diagnostics = runtime._select_policy(scores, score_diag, viability)
+
+    assert diagnostics["source"] == "trm_ag"
+    assert diagnostics["ag_control_mode"] == 2
+    assert action != "approach"
+    assert float(policy[ACTIONS.index("approach")]) < float(policy[ACTIONS.index("withdraw")])
+
+
+def test_select_policy_trm_ag_prunes_high_inhibition_even_with_partial_blend() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeActionScorer:
+        def __call__(self, viability_state, action_scores, uncertainty_state, env_contact_state=None, species_contact_state=None):
+            batch = action_scores.shape[0]
+            logits = torch.tensor([[4.0, 0.5, 2.5, -1.0, -1.0]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "action_state": torch.ones((batch, 32), dtype=torch.float32),
+                "policy_logits": logits,
+                "policy_prob": torch.softmax(logits, dim=-1),
+                "action_uncertainty": torch.full((batch, 5), 0.1, dtype=torch.float32),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+            }
+
+    class FakeActionGating:
+        def __call__(self, input_view):
+            batch = input_view.shape[0]
+            gated = torch.tensor([[1.5, 1.0, 0.8, 0.5, 0.4]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "gating_state": torch.ones((batch, 32), dtype=torch.float32),
+                "gating_logits": torch.zeros((batch, 5), dtype=torch.float32),
+                "gated_policy_logits": gated,
+                "inhibition_mask": torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32).repeat(batch, 1),
+                "control_mode_logits": torch.tensor([[-1.0, -1.0, 3.0]], dtype=torch.float32).repeat(batch, 1),
+                "control_mode_prob": torch.softmax(torch.tensor([[-1.0, -1.0, 3.0]], dtype=torch.float32), dim=-1).repeat(batch, 1),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "action_mode": "assistive",
+            "action_gating_mode": "assistive",
+            "context_memory_mode": "analytic",
+            "action_gating_blend": 0.35,
+        }
+    )
+    runtime.models = SimpleNamespace(
+        trm_a=None,
+        trm_b=None,
+        trm_vm=None,
+        trm_as=FakeActionScorer(),
+        trm_ag=FakeActionGating(),
+        trm_mc=None,
+        torch=torch,
+    )
+    scores = np.array([0.2, 0.3, 0.32, 0.35, 0.28], dtype=np.float32)
+    score_diag = {action: {"risk": float(scores[i]), "ambiguity": 0.0, "epistemic": 0.0, "pred_G": 0.5, "pred_B": 0.5, "death_risk": 0.0, "contact_risk": 0.0} for i, action in enumerate(ACTIONS)}
+    viability = {
+        "state": np.array([0.55, 0.65], dtype=np.float32),
+        "risk": 0.4,
+        "precision": 1.0,
+        "homeostatic_error": 0.1,
+        "homeostatic_error_vector": np.array([0.1, 0.0], dtype=np.float32),
+        "source": "analytic",
+    }
+
+    policy, action, diagnostics = runtime._select_policy(scores, score_diag, viability)
+
+    assert diagnostics["source"] == "trm_ag"
+    assert diagnostics["ag_control_mode"] == 2
+    assert action != "approach"
+    assert float(policy[ACTIONS.index("approach")]) < float(policy[ACTIONS.index("withdraw")])
+
+
+def test_select_policy_trm_ag_hard_gate_drops_defensive_blocked_action() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeActionScorer:
+        def __call__(self, viability_state, action_scores, uncertainty_state, env_contact_state=None, species_contact_state=None):
+            batch = action_scores.shape[0]
+            logits = torch.tensor([[5.0, 1.0, 1.0, 0.5, 0.5]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "action_state": torch.ones((batch, 32), dtype=torch.float32),
+                "policy_logits": logits,
+                "policy_prob": torch.softmax(logits, dim=-1),
+                "action_uncertainty": torch.full((batch, 5), 0.1, dtype=torch.float32),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+            }
+
+    class FakeActionGating:
+        def __call__(self, input_view):
+            batch = input_view.shape[0]
+            gated = torch.tensor([[4.5, 1.5, 1.5, 1.0, 1.0]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "gating_state": torch.ones((batch, 32), dtype=torch.float32),
+                "gating_logits": torch.zeros((batch, 5), dtype=torch.float32),
+                "gated_policy_logits": gated,
+                "inhibition_mask": torch.tensor([[0.92, 0.05, 0.05, 0.10, 0.10]], dtype=torch.float32).repeat(batch, 1),
+                "control_mode_logits": torch.tensor([[-1.0, -1.0, 3.0]], dtype=torch.float32).repeat(batch, 1),
+                "control_mode_prob": torch.softmax(torch.tensor([[-1.0, -1.0, 3.0]], dtype=torch.float32), dim=-1).repeat(batch, 1),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "action_mode": "assistive",
+            "action_gating_mode": "assistive",
+            "context_memory_mode": "analytic",
+            "action_gating_blend": 0.35,
+        }
+    )
+    runtime.models = SimpleNamespace(
+        trm_a=None,
+        trm_b=None,
+        trm_vm=None,
+        trm_as=FakeActionScorer(),
+        trm_ag=FakeActionGating(),
+        trm_mc=None,
+        torch=torch,
+    )
+    scores = np.array([0.2, 0.3, 0.32, 0.35, 0.28], dtype=np.float32)
+    score_diag = {action: {"risk": float(scores[i]), "ambiguity": 0.0, "epistemic": 0.0, "pred_G": 0.5, "pred_B": 0.5, "death_risk": 0.0, "contact_risk": 0.0} for i, action in enumerate(ACTIONS)}
+    viability = {
+        "state": np.array([0.55, 0.65], dtype=np.float32),
+        "risk": 0.5,
+        "precision": 1.0,
+        "homeostatic_error": 0.12,
+        "homeostatic_error_vector": np.array([0.1, 0.02], dtype=np.float32),
+        "source": "analytic",
+    }
+
+    policy, action, diagnostics = runtime._select_policy(scores, score_diag, viability)
+
+    assert diagnostics["source"] == "trm_ag"
+    assert diagnostics["ag_control_mode"] == 2
+    assert action != "approach"
+    assert float(policy[ACTIONS.index("approach")]) < 0.01
+
+
+def test_select_policy_module_primary_can_use_trm_ag_logits_directly() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeActionScorer:
+        def __call__(self, viability_state, action_scores, uncertainty_state, env_contact_state=None, species_contact_state=None):
+            batch = action_scores.shape[0]
+            logits = torch.tensor([[5.0, -2.0, -1.0, -2.0, -2.0]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "action_state": torch.ones((batch, 32), dtype=torch.float32),
+                "policy_logits": logits,
+                "policy_prob": torch.softmax(logits, dim=-1),
+                "action_uncertainty": torch.full((batch, 5), 0.1, dtype=torch.float32),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+            }
+
+    class FakeActionGating:
+        def __call__(self, input_view):
+            batch = input_view.shape[0]
+            gated = torch.tensor([[-3.0, -1.0, -1.0, -1.0, 4.0]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "gating_state": torch.ones((batch, 32), dtype=torch.float32),
+                "gating_logits": torch.zeros((batch, 5), dtype=torch.float32),
+                "gated_policy_logits": gated,
+                "inhibition_mask": torch.tensor([[1.0, 0.2, 0.2, 0.2, 0.0]], dtype=torch.float32).repeat(batch, 1),
+                "control_mode_logits": torch.tensor([[-1.0, 0.5, 2.0]], dtype=torch.float32).repeat(batch, 1),
+                "control_mode_prob": torch.softmax(torch.tensor([[-1.0, 0.5, 2.0]], dtype=torch.float32), dim=-1).repeat(batch, 1),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "action_mode": "module_primary",
+            "action_gating_mode": "module_primary",
+            "context_memory_mode": "analytic",
+        }
+    )
+    runtime.models = SimpleNamespace(
+        trm_a=None,
+        trm_b=None,
+        trm_vm=None,
+        trm_as=FakeActionScorer(),
+        trm_ag=FakeActionGating(),
+        trm_mc=None,
+        torch=torch,
+    )
+    scores = np.array([0.2, 0.3, 0.32, 0.35, 0.28], dtype=np.float32)
+    score_diag = {action: {"risk": float(scores[i]), "ambiguity": 0.0, "epistemic": 0.0, "pred_G": 0.5, "pred_B": 0.5, "death_risk": 0.0, "contact_risk": 0.0} for i, action in enumerate(ACTIONS)}
+    viability = {
+        "state": np.array([0.55, 0.65], dtype=np.float32),
+        "risk": 0.4,
+        "precision": 1.0,
+        "homeostatic_error": 0.1,
+        "homeostatic_error_vector": np.array([0.1, 0.0], dtype=np.float32),
+        "source": "analytic",
+    }
+
+    policy, action, diagnostics = runtime._select_policy(scores, score_diag, viability)
+
+    assert diagnostics["source"] == "trm_ag_primary"
+    assert action == "reconfigure"
+    assert float(policy[ACTIONS.index("reconfigure")]) > 0.95
+    assert float(policy[ACTIONS.index("reconfigure")]) == pytest.approx(float(policy.max()))
+
+
+def test_apply_bp_control_uses_assistive_trm_bp_when_available() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeBoundaryController:
+        def __call__(self, bp_input_view):
+            batch = bp_input_view.shape[0]
+            return {
+                "bp_state": torch.ones((batch, 32), dtype=torch.float32),
+                "pred_permeability_patch": torch.full((batch, 16, 16, 1), 0.8, dtype=torch.float32),
+                "pred_interface_gain": torch.full((batch, 1), 0.9, dtype=torch.float32),
+                "pred_aperture_gain": torch.full((batch, 1), 0.95, dtype=torch.float32),
+                "mode_logits": torch.tensor([[-2.0, -2.0, 4.0]], dtype=torch.float32).repeat(batch, 1),
+                "mode_prob": torch.softmax(
+                    torch.tensor([[-2.0, -2.0, 4.0]], dtype=torch.float32).repeat(batch, 1),
+                    dim=-1,
+                ),
+                "mode_uncertainty": torch.full((batch, 3), 0.1, dtype=torch.float32),
+                "module_precision": torch.ones((batch,), dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "boundary_control_mode": "assistive",
+            "boundary_control_blend": 0.5,
+        }
+    )
+    runtime.models = SimpleNamespace(trm_a=None, trm_b=None, trm_vm=None, trm_as=None, trm_bp=FakeBoundaryController(), torch=torch)
+    baseline_body = runtime._prospective_body("seal")
+
+    controlled_body, diagnostics = runtime._apply_bp_control("seal", baseline_body)
+
+    assert diagnostics["source"] == "trm_bp"
+    assert diagnostics["pred_mode"] == 2
+    assert controlled_body.aperture_gain > baseline_body.aperture_gain
+    assert controlled_body.aperture_width_deg != pytest.approx(baseline_body.aperture_width_deg)
+
+
+def test_apply_bp_control_module_primary_uses_trm_bp_prediction_directly() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeBoundaryController:
+        def __call__(self, bp_input_view):
+            batch = bp_input_view.shape[0]
+            return {
+                "bp_state": torch.ones((batch, 32), dtype=torch.float32),
+                "pred_permeability_patch": torch.full((batch, 16, 16, 1), 0.6, dtype=torch.float32),
+                "pred_interface_gain": torch.full((batch, 1), 0.8, dtype=torch.float32),
+                "pred_aperture_gain": torch.full((batch, 1), 0.7, dtype=torch.float32),
+                "mode_logits": torch.tensor([[-1.0, -2.0, 3.0]], dtype=torch.float32).repeat(batch, 1),
+                "mode_prob": torch.softmax(
+                    torch.tensor([[-1.0, -2.0, 3.0]], dtype=torch.float32).repeat(batch, 1),
+                    dim=-1,
+                ),
+                "mode_uncertainty": torch.full((batch, 3), 0.1, dtype=torch.float32),
+                "module_precision": torch.full((batch,), 0.75, dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(**{**runtime.cfg.__dict__, "boundary_control_mode": "module_primary"})
+    runtime.models = SimpleNamespace(trm_a=None, trm_b=None, trm_vm=None, trm_as=None, trm_bp=FakeBoundaryController(), torch=torch)
+    baseline_body = runtime._prospective_body("intake")
+
+    controlled_body, diagnostics = runtime._apply_bp_control("intake", baseline_body)
+
+    expected_gain = float(np.clip(0.7 + 0.15 * 0.8, runtime.cfg.base_permeability, 1.0))
+    assert diagnostics["source"] == "trm_bp_primary"
+    assert diagnostics["pred_mode"] == 2
+    assert controlled_body.aperture_gain == pytest.approx(expected_gain)
+    assert controlled_body.aperture_width_deg == pytest.approx(
+        np.clip(baseline_body.aperture_width_deg + 12.0, 40.0, 120.0)
+    )
+
+
+def test_apply_bp_control_uses_mc_boundary_bias_in_assistive_mode() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeBoundaryController:
+        def __call__(self, bp_input_view):
+            batch = bp_input_view.shape[0]
+            return {
+                "bp_state": torch.ones((batch, 32), dtype=torch.float32),
+                "pred_permeability_patch": torch.full((batch, 16, 16, 1), 0.55, dtype=torch.float32),
+                "pred_interface_gain": torch.zeros((batch, 1), dtype=torch.float32),
+                "pred_aperture_gain": torch.full((batch, 1), 0.5, dtype=torch.float32),
+                "mode_logits": torch.tensor([[3.0, -2.0, -2.0]], dtype=torch.float32).repeat(batch, 1),
+                "mode_prob": torch.softmax(
+                    torch.tensor([[3.0, -2.0, -2.0]], dtype=torch.float32).repeat(batch, 1),
+                    dim=-1,
+                ),
+                "mode_uncertainty": torch.full((batch, 3), 0.1, dtype=torch.float32),
+                "module_precision": torch.full((batch,), 0.9, dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "boundary_control_mode": "assistive",
+            "boundary_control_blend": 0.6,
+            "context_memory_mode": "assistive",
+            "context_memory_residual_scale": 2.0,
+        }
+    )
+    runtime.models = SimpleNamespace(trm_a=None, trm_b=None, trm_vm=None, trm_as=None, trm_bp=FakeBoundaryController(), torch=torch)
+    baseline_body = runtime._prospective_body("intake")
+    context_bias = {
+        "source": "trm_mc",
+        "model_precision": 0.9,
+        "boundary_control_bias": np.array([-1.5, 2.0, 1.5], dtype=np.float32),
+    }
+
+    controlled_body, diagnostics = runtime._apply_bp_control("intake", baseline_body, context_bias=context_bias)
+
+    assert diagnostics["source"] == "trm_bp"
+    assert diagnostics["context_source"] == "trm_mc"
+    assert diagnostics["context_boundary_bias_norm"] > 0.0
+    assert diagnostics["effective_mode"] == 2
+    assert controlled_body.aperture_gain < baseline_body.aperture_gain
+    assert controlled_body.aperture_width_deg > baseline_body.aperture_width_deg
+
+
+def test_apply_bp_control_analytic_context_mode_ignores_mc_boundary_bias() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeBoundaryController:
+        def __call__(self, bp_input_view):
+            batch = bp_input_view.shape[0]
+            return {
+                "bp_state": torch.ones((batch, 32), dtype=torch.float32),
+                "pred_permeability_patch": torch.full((batch, 16, 16, 1), 0.55, dtype=torch.float32),
+                "pred_interface_gain": torch.zeros((batch, 1), dtype=torch.float32),
+                "pred_aperture_gain": torch.full((batch, 1), 0.5, dtype=torch.float32),
+                "mode_logits": torch.tensor([[3.0, -2.0, -2.0]], dtype=torch.float32).repeat(batch, 1),
+                "mode_prob": torch.softmax(
+                    torch.tensor([[3.0, -2.0, -2.0]], dtype=torch.float32).repeat(batch, 1),
+                    dim=-1,
+                ),
+                "mode_uncertainty": torch.full((batch, 3), 0.1, dtype=torch.float32),
+                "module_precision": torch.full((batch,), 0.9, dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "boundary_control_mode": "assistive",
+            "boundary_control_blend": 0.6,
+            "context_memory_mode": "analytic",
+            "context_memory_residual_scale": 2.0,
+        }
+    )
+    runtime.models = SimpleNamespace(trm_a=None, trm_b=None, trm_vm=None, trm_as=None, trm_bp=FakeBoundaryController(), torch=torch)
+    baseline_body = runtime._prospective_body("intake")
+    context_bias = {
+        "source": "trm_mc",
+        "model_precision": 0.9,
+        "boundary_control_bias": np.array([-1.5, 2.0, 1.5], dtype=np.float32),
+    }
+
+    controlled_body, diagnostics = runtime._apply_bp_control("intake", baseline_body, context_bias=context_bias)
+
+    assert diagnostics["context_source"] == "trm_mc"
+    assert diagnostics["context_boundary_scale"] == pytest.approx(0.0)
+    assert diagnostics["effective_mode"] == diagnostics["pred_mode"]
+    assert controlled_body.aperture_width_deg == pytest.approx(baseline_body.aperture_width_deg)
+
+
+def test_step_history_contains_bp_control_logs() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeBoundaryController:
+        def __call__(self, bp_input_view):
+            batch = bp_input_view.shape[0]
+            return {
+                "bp_state": torch.ones((batch, 32), dtype=torch.float32),
+                "pred_permeability_patch": torch.full((batch, 16, 16, 1), 0.55, dtype=torch.float32),
+                "pred_interface_gain": torch.full((batch, 1), 0.6, dtype=torch.float32),
+                "pred_aperture_gain": torch.full((batch, 1), 0.85, dtype=torch.float32),
+                "mode_logits": torch.tensor([[-2.0, 4.0, -2.0]], dtype=torch.float32).repeat(batch, 1),
+                "mode_prob": torch.softmax(
+                    torch.tensor([[-2.0, 4.0, -2.0]], dtype=torch.float32).repeat(batch, 1),
+                    dim=-1,
+                ),
+                "mode_uncertainty": torch.full((batch, 3), 0.1, dtype=torch.float32),
+                "module_precision": torch.full((batch,), 0.9, dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "policy_mode": "no_action",
+            "boundary_control_mode": "assistive",
+        }
+    )
+    runtime.models = SimpleNamespace(trm_a=None, trm_b=None, trm_vm=None, trm_as=None, trm_bp=FakeBoundaryController(), torch=torch)
+
+    runtime.step(0)
+    row = runtime.history[-1]
+
+    assert row["bp_control_source"] == "trm_bp"
+    assert row["bp_model_precision"] == pytest.approx(0.9)
+    assert row["bp_pred_interface_gain"] == pytest.approx(0.6)
+    assert row["bp_pred_aperture_gain"] == pytest.approx(0.85)
+    assert row["bp_pred_mode"] == 1
+    assert row["bp_context_source"] == "analytic"
+    assert row["bp_context_bias_norm"] == pytest.approx(0.0)
+
+
+def test_step_history_contains_mc_logs() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeActionScorer:
+        def __call__(self, viability_state, action_scores, uncertainty_state, env_contact_state=None, species_contact_state=None):
+            batch = action_scores.shape[0]
+            logits = torch.tensor([[-2.0, -2.0, -2.0, -2.0, 4.0]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "action_state": torch.ones((batch, 32), dtype=torch.float32),
+                "policy_logits": logits,
+                "policy_prob": torch.softmax(logits, dim=-1),
+                "action_uncertainty": torch.full((batch, 5), 0.1, dtype=torch.float32),
+                "module_precision": torch.full((batch,), 0.9, dtype=torch.float32),
+            }
+
+    class FakeBoundaryController:
+        def __call__(self, bp_input_view):
+            batch = bp_input_view.shape[0]
+            return {
+                "bp_state": torch.ones((batch, 32), dtype=torch.float32),
+                "pred_permeability_patch": torch.full((batch, 16, 16, 1), 0.55, dtype=torch.float32),
+                "pred_interface_gain": torch.full((batch, 1), 0.4, dtype=torch.float32),
+                "pred_aperture_gain": torch.full((batch, 1), 0.8, dtype=torch.float32),
+                "mode_logits": torch.tensor([[-2.0, 4.0, -2.0]], dtype=torch.float32).repeat(batch, 1),
+                "mode_prob": torch.softmax(
+                    torch.tensor([[-2.0, 4.0, -2.0]], dtype=torch.float32).repeat(batch, 1),
+                    dim=-1,
+                ),
+                "mode_uncertainty": torch.full((batch, 3), 0.1, dtype=torch.float32),
+                "module_precision": torch.full((batch,), 0.9, dtype=torch.float32),
+            }
+
+    class FakeMemoryContext:
+        def __call__(self, input_view, window_mask=None):
+            batch = input_view.shape[0]
+            return {
+                "context_state": torch.ones((batch, 32), dtype=torch.float32),
+                "retrieved_context": torch.ones((batch, 44), dtype=torch.float32),
+                "sequence_bias": torch.tensor([[0.0, 0.0, 0.0, 3.0, 0.0]], dtype=torch.float32).repeat(batch, 1),
+                "boundary_control_bias": torch.tensor([[0.0, 1.5, 1.5]], dtype=torch.float32).repeat(batch, 1),
+                "module_precision": torch.full((batch,), 0.8, dtype=torch.float32),
+                "context_uncertainty": torch.full((batch,), 0.2, dtype=torch.float32),
+                "window_lengths": torch.full((batch,), 1.0, dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "context_memory_mode": "assistive",
+            "policy_mode": "closed_loop",
+        }
+    )
+    runtime.models = SimpleNamespace(
+        trm_a=None,
+        trm_b=None,
+        trm_vm=None,
+        trm_as=FakeActionScorer(),
+        trm_bp=FakeBoundaryController(),
+        trm_mc=FakeMemoryContext(),
+        torch=torch,
+    )
+
+    runtime.step(0)
+    row = runtime.history[-1]
+
+    assert row["mc_context_source"] == "trm_mc"
+    assert row["mc_model_precision"] == pytest.approx(0.8)
+    assert row["mc_window_length"] == 1
+    assert row["mc_bias_norm"] > 0.0
+    assert row["bp_context_source"] == "trm_mc"
+    assert row["bp_context_bias_norm"] > 0.0
+
+
+def test_step_history_contains_ag_logs() -> None:
+    torch, _, _ = require_torch()
+
+    class FakeActionScorer:
+        def __call__(self, viability_state, action_scores, uncertainty_state, env_contact_state=None, species_contact_state=None):
+            batch = action_scores.shape[0]
+            logits = torch.tensor([[4.0, 1.0, 2.0, 0.5, 0.5]], dtype=torch.float32).repeat(batch, 1)
+            return {
+                "action_state": torch.ones((batch, 32), dtype=torch.float32),
+                "policy_logits": logits,
+                "policy_prob": torch.softmax(logits, dim=-1),
+                "action_uncertainty": torch.full((batch, 5), 0.1, dtype=torch.float32),
+                "module_precision": torch.full((batch,), 0.9, dtype=torch.float32),
+            }
+
+    class FakeActionGating:
+        def __call__(self, input_view):
+            batch = input_view.shape[0]
+            return {
+                "gating_state": torch.ones((batch, 32), dtype=torch.float32),
+                "gating_logits": torch.zeros((batch, 5), dtype=torch.float32),
+                "gated_policy_logits": torch.tensor([[1.0, 1.0, 3.0, 1.0, 1.0]], dtype=torch.float32).repeat(batch, 1),
+                "inhibition_mask": torch.tensor([[0.95, 0.10, 0.15, 0.05, 0.05]], dtype=torch.float32).repeat(batch, 1),
+                "control_mode_logits": torch.tensor([[-1.0, -1.0, 3.0]], dtype=torch.float32).repeat(batch, 1),
+                "control_mode_prob": torch.softmax(torch.tensor([[-1.0, -1.0, 3.0]], dtype=torch.float32), dim=-1).repeat(batch, 1),
+                "module_precision": torch.full((batch,), 0.85, dtype=torch.float32),
+            }
+
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "policy_mode": "closed_loop",
+            "action_mode": "assistive",
+            "action_gating_mode": "assistive",
+            "context_memory_mode": "analytic",
+        }
+    )
+    runtime.models = SimpleNamespace(
+        trm_a=None,
+        trm_b=None,
+        trm_vm=None,
+        trm_as=FakeActionScorer(),
+        trm_ag=FakeActionGating(),
+        trm_bp=None,
+        trm_mc=None,
+        torch=torch,
+    )
+
+    runtime.step(0)
+    row = runtime.history[-1]
+
+    assert row["ag_source"] == "trm_ag"
+    assert row["ag_model_precision"] == pytest.approx(0.85)
+    assert row["ag_control_mode"] == 2
+    assert row["ag_max_inhibition"] == pytest.approx(0.95)
+    assert row["ag_blocked_action_count"] >= 1
 
 
 def test_step_runs_with_real_trm_checkpoints(tmp_path: Path) -> None:
@@ -736,6 +1685,10 @@ def test_closed_loop_step_emits_valid_policy_distribution_and_state_ranges() -> 
     assert row["contact_resource"] >= 0.0
     assert row["contact_hazard"] >= 0.0
     assert row["contact_shelter"] >= 0.0
+    assert row["contact_energy"] >= 0.0
+    assert row["contact_thermal"] >= 0.0
+    assert row["contact_toxicity"] >= 0.0
+    assert row["contact_niche"] >= 0.0
     assert row["homeostatic_error"] >= 0.0
 
 
@@ -780,7 +1733,9 @@ def test_closed_loop_outperforms_no_action_in_controlled_resource_corridor() -> 
     closed_actions = [row["action"] for row in closed_loop.history]
     no_action_actions = [row["action"] for row in no_action.history]
 
-    assert closed_loop.body.G > no_action.body.G
+    closed_error = abs(closed_loop.body.G - closed_loop.cfg.G_target) + abs(closed_loop.body.B - closed_loop.cfg.B_target)
+    no_action_error = abs(no_action.body.G - no_action.cfg.G_target) + abs(no_action.body.B - no_action.cfg.B_target)
+    assert closed_error < no_action_error
     assert closed_actions[0] == "approach"
     assert "intake" in closed_actions[1:]
     assert all(action == "no_action" for action in no_action_actions)
@@ -872,6 +1827,9 @@ def test_run_episode_recorded_arrays_match_summary(tmp_path: Path) -> None:
     assert arrays["boundary"].shape[0] == expected_frames
     assert arrays["permeability"].shape[0] == expected_frames
     assert arrays["env_channels"].shape[0] == expected_frames
+    assert arrays["external_state"].shape[0] == expected_frames
+    assert arrays["species_sources"].shape[0] == expected_frames
+    assert arrays["species_fields"].shape[0] == expected_frames
     assert arrays["world_belief"].shape[0] == expected_frames
     assert arrays["boundary_belief"].shape[0] == expected_frames
 
@@ -896,6 +1854,16 @@ def test_run_episode_summary_contains_homeostatic_metrics(tmp_path: Path) -> Non
     assert "mean_contact_resource" in summary
     assert "mean_contact_hazard" in summary
     assert "mean_contact_shelter" in summary
+    assert "mean_contact_energy" in summary
+    assert "mean_contact_thermal" in summary
+    assert "mean_contact_toxicity" in summary
+    assert "mean_contact_niche" in summary
+    assert "mean_contact_species_energy" in summary
+    assert "mean_contact_species_thermal" in summary
+    assert "mean_contact_species_toxicity" in summary
+    assert "mean_contact_species_niche" in summary
+    assert summary["multispecies_enabled"] is True
+    assert summary["species_roles"] == ["species_energy", "species_toxic", "species_niche"]
     assert "action_diversity" in summary
     assert 0.0 <= summary["survival_fraction"] <= 1.0
     assert 0.0 <= summary["mean_G"] <= 1.0

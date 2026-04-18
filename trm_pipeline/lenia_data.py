@@ -342,6 +342,11 @@ def generate_rollouts(
     rng = np.random.default_rng(config.root_seed)
     selected_indices = rng.choice(len(seeds), size=config.num_seeds, replace=False)
     manifest: list[dict[str, Any]] = []
+    regime_counts: dict[str, int] = {}
+    split_counts: dict[str, int] = {}
+    perturb_counts = {"none": 0, "local": 0, "global": 0}
+    mu_values: list[float] = []
+    sigma_values: list[float] = []
     for order_idx, seed_idx in enumerate(selected_indices.tolist()):
         seed = seeds[seed_idx]
         episode = sample_episode(seed, config, rng)
@@ -375,6 +380,13 @@ def generate_rollouts(
                 "regime_stats": meta["regime_stats"],
             }
         )
+        regime = str(meta["regime"])
+        regime_counts[regime] = int(regime_counts.get(regime, 0) + 1)
+        split_counts[split] = int(split_counts.get(split, 0) + 1)
+        perturb_key = str(meta["perturb_mode"] or "none")
+        perturb_counts[perturb_key] = int(perturb_counts.get(perturb_key, 0) + 1)
+        mu_values.append(float(meta["lenia_params"]["m"]))
+        sigma_values.append(float(meta["lenia_params"]["s"]))
     manifest_path = output_root / "manifest.jsonl"
     save_jsonl(manifest_path, manifest)
     save_json(
@@ -387,6 +399,11 @@ def generate_rollouts(
             "record_steps": config.record_steps,
             "target_radius": config.target_radius,
             "root_seed": config.root_seed,
+            "regime_counts": regime_counts,
+            "split_counts": split_counts,
+            "perturb_counts": perturb_counts,
+            "mu_range": [float(min(mu_values)), float(max(mu_values))] if mu_values else None,
+            "sigma_range": [float(min(sigma_values)), float(max(sigma_values))] if sigma_values else None,
         },
     )
     return manifest_path

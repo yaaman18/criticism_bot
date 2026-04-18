@@ -18,8 +18,8 @@ def _as_manifest(tmp_path: Path) -> Path:
         n = 10
         viability = rng.uniform(0.2, 0.9, size=(n, 2)).astype(np.float32)
         action_scores = rng.normal(0.0, 0.4, size=(n, 5)).astype(np.float32)
-        uncertainty = rng.uniform(0.0, 1.0, size=(n, 3)).astype(np.float32)
-        target_logits = (-3.0 * action_scores + 0.5 * uncertainty[:, :1]).astype(np.float32)
+        uncertainty = rng.uniform(0.0, 1.0, size=(n, 4)).astype(np.float32)
+        target_logits = (-3.0 * action_scores + 0.5 * uncertainty[:, :1] - 0.15 * uncertainty[:, 2:3]).astype(np.float32)
         target_logits -= target_logits.mean(axis=1, keepdims=True)
         exp = np.exp(target_logits - target_logits.max(axis=1, keepdims=True))
         target_policy = (exp / exp.sum(axis=1, keepdims=True)).astype(np.float32)
@@ -90,6 +90,42 @@ def test_compute_trm_as_loss_penalizes_low_entropy_when_enabled() -> None:
     assert float(loss_peaked.detach().cpu().item()) > float(loss_softer.detach().cpu().item())
     assert parts_peaked["loss_entropy"] > 0.0
     assert parts_softer["loss_entropy"] <= parts_peaked["loss_entropy"]
+
+
+def test_compute_trm_as_loss_penalizes_bad_pairwise_ranking() -> None:
+    batch = {
+        "as_target_action": torch.tensor([0, 1], dtype=torch.int64),
+        "as_target_logits": torch.tensor(
+            [[3.0, 2.0, 1.0, 0.0, -1.0], [1.0, 3.0, 2.0, 0.0, -1.0]],
+            dtype=torch.float32,
+        ),
+        "as_target_policy": torch.tensor(
+            [
+                [0.60, 0.25, 0.10, 0.03, 0.02],
+                [0.20, 0.55, 0.18, 0.05, 0.02],
+            ],
+            dtype=torch.float32,
+        ),
+    }
+    aligned = {
+        "policy_logits": torch.tensor(
+            [[2.5, 1.5, 0.5, -0.5, -1.5], [0.5, 2.5, 1.5, -0.5, -1.5]],
+            dtype=torch.float32,
+        )
+    }
+    reversed_rank = {
+        "policy_logits": torch.tensor(
+            [[-1.5, -0.5, 0.5, 1.5, 2.5], [-1.5, -0.5, 0.5, 1.5, 2.5]],
+            dtype=torch.float32,
+        )
+    }
+
+    config = TrainAsConfig(lambda_hard_action=0.0, lambda_logits=0.0, lambda_policy_kl=0.0, lambda_pairwise=1.0)
+    loss_aligned, parts_aligned = compute_trm_as_loss(aligned, batch, config)
+    loss_reversed, parts_reversed = compute_trm_as_loss(reversed_rank, batch, config)
+
+    assert float(loss_reversed.detach().cpu().item()) > float(loss_aligned.detach().cpu().item())
+    assert parts_reversed["loss_pairwise"] > parts_aligned["loss_pairwise"]
 
 
 def test_train_trm_as_smoke_writes_checkpoint_and_metrics(tmp_path: Path) -> None:

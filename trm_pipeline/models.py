@@ -26,6 +26,8 @@ class TRMModelConfig:
     mlp_ratio: int = 4
     halt_threshold: float = 0.7
     in_channels: int = 5
+    out_channels: int | None = None
+    boundary_in_channels_total: int = 15
     z_dim: int = 32
     logvar_min: float = -6.0
     logvar_max: float = 2.0
@@ -53,6 +55,21 @@ def get_trm_registry() -> dict[str, dict[str, Any]]:
             "role": "action_scoring",
             "builder": build_trm_as,
             "adapter": _adapt_trm_as_outputs,
+        },
+        "trm_ag": {
+            "role": "action_gating",
+            "builder": build_trm_ag,
+            "adapter": _adapt_trm_ag_outputs,
+        },
+        "trm_bp": {
+            "role": "boundary_permeability_control",
+            "builder": build_trm_bp,
+            "adapter": _adapt_trm_bp_outputs,
+        },
+        "trm_mc": {
+            "role": "memory_context",
+            "builder": build_trm_mc,
+            "adapter": _adapt_trm_mc_outputs,
         },
     }
 
@@ -143,6 +160,50 @@ def _adapt_trm_as_outputs(outputs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _adapt_trm_ag_outputs(outputs: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "module_state": outputs["gating_state"],
+        "module_precision": outputs["module_precision"],
+        "module_error": outputs["inhibition_mask"].mean(dim=-1),
+        "module_aux": {
+            "gating_logits": outputs["gating_logits"],
+            "gated_policy_logits": outputs["gated_policy_logits"],
+            "inhibition_mask": outputs["inhibition_mask"],
+            "control_mode_logits": outputs["control_mode_logits"],
+            "control_mode_prob": outputs["control_mode_prob"],
+        },
+    }
+
+
+def _adapt_trm_bp_outputs(outputs: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "module_state": outputs["bp_state"],
+        "module_precision": outputs["module_precision"],
+        "module_error": outputs["mode_uncertainty"],
+        "module_aux": {
+            "pred_permeability_patch": outputs["pred_permeability_patch"],
+            "pred_interface_gain": outputs["pred_interface_gain"],
+            "pred_aperture_gain": outputs["pred_aperture_gain"],
+            "mode_logits": outputs["mode_logits"],
+            "mode_prob": outputs["mode_prob"],
+        },
+    }
+
+
+def _adapt_trm_mc_outputs(outputs: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "module_state": outputs["context_state"],
+        "module_precision": outputs["module_precision"],
+        "module_error": outputs["context_uncertainty"],
+        "module_aux": {
+            "retrieved_context": outputs["retrieved_context"],
+            "sequence_bias": outputs["sequence_bias"],
+            "boundary_control_bias": outputs["boundary_control_bias"],
+            "window_lengths": outputs["window_lengths"],
+        },
+    }
+
+
 def patchify(images, patch_size: int):
     torch, _, _ = require_torch()
     batch, height, width, channels = images.shape
@@ -210,13 +271,15 @@ def build_trm_a(config: TRMModelConfig):
     class TRMAPredictor(nn.Module):
         def __init__(self):
             super().__init__()
-            token_dim = config.patch_size * config.patch_size * config.in_channels
-            self.input_proj = nn.Linear(token_dim, config.dim)
+            out_channels = config.out_channels if config.out_channels is not None else config.in_channels
+            token_dim_in = config.patch_size * config.patch_size * config.in_channels
+            token_dim_out = config.patch_size * config.patch_size * out_channels
+            self.input_proj = nn.Linear(token_dim_in, config.dim)
             self.position = nn.Parameter(
                 torch.zeros(1, (config.image_size // config.patch_size) ** 2, config.dim)
             )
             self.core = _build_recursive_token_block(config)
-            self.posterior_input_proj = nn.Linear(token_dim * 2, config.dim)
+            self.posterior_input_proj = nn.Linear(token_dim_in + token_dim_out, config.dim)
             self.posterior_mlp = nn.Sequential(
                 nn.LayerNorm(config.dim),
                 nn.Linear(config.dim, config.dim),
@@ -232,12 +295,13 @@ def build_trm_a(config: TRMModelConfig):
                 nn.Linear(config.dim, config.z_dim * 2),
             )
             self.latent_proj = nn.Linear(config.z_dim, config.dim)
-            self.mean_head = nn.Linear(config.dim, token_dim)
-            self.logvar_head = nn.Linear(config.dim, token_dim)
+            self.mean_head = nn.Linear(config.dim, token_dim_out)
+            self.logvar_head = nn.Linear(config.dim, token_dim_out)
             self.halt_head = nn.Sequential(
                 nn.LayerNorm(config.dim),
                 nn.Linear(config.dim, 1),
             )
+            self.out_channels = out_channels
 
         def _split_stats(self, tensor):
             mu, logvar = tensor.chunk(2, dim=-1)
@@ -298,7 +362,7 @@ def build_trm_a(config: TRMModelConfig):
                         mean_patches,
                         image_size=config.image_size,
                         patch_size=config.patch_size,
-                        channels=config.in_channels,
+                        channels=self.out_channels,
                     )
                 )
                 pred_logvar_steps.append(
@@ -306,7 +370,7 @@ def build_trm_a(config: TRMModelConfig):
                         logvar_patches,
                         image_size=config.image_size,
                         patch_size=config.patch_size,
-                        channels=config.in_channels,
+                        channels=self.out_channels,
                     )
                 )
             halt_logits_tensor = torch.stack(halt_logits, dim=1)
@@ -344,7 +408,7 @@ def build_trm_b(config: TRMModelConfig):
     class TRMBoundaryModel(nn.Module):
         def __init__(self):
             super().__init__()
-            in_channels = 15
+            in_channels = int(config.boundary_in_channels_total)
             patch_dim = config.patch_size * config.patch_size * in_channels
             self.input_proj = nn.Linear(patch_dim, config.dim)
             self.position = nn.Parameter(
@@ -396,7 +460,7 @@ def build_trm_vm(config: TRMModelConfig):
     class TRMViabilityMonitor(nn.Module):
         def __init__(self):
             super().__init__()
-            input_dim = 6  # viability(2) + contacts(3) + action_cost(1)
+            input_dim = 11  # viability(2) + env_contacts(4) + species_contacts(4) + action_cost(1)
             hidden = max(config.dim // 2, 16)
             self.encoder = nn.Sequential(
                 nn.LayerNorm(input_dim),
@@ -410,6 +474,13 @@ def build_trm_vm(config: TRMModelConfig):
             self.precision_head = nn.Linear(config.dim, 1)
 
         def forward(self, viability_state, contact_state, action_cost):
+            if contact_state.shape[-1] == 4:
+                zeros = torch.zeros(
+                    (*contact_state.shape[:-1], 4),
+                    dtype=contact_state.dtype,
+                    device=contact_state.device,
+                )
+                contact_state = torch.cat([contact_state, zeros], dim=-1)
             x = torch.cat([viability_state, contact_state, action_cost], dim=-1)
             latent = self.encoder(x)
             viability_delta = torch.tanh(self.viability_head(latent)) * 0.1
@@ -434,7 +505,7 @@ def build_trm_as(config: TRMModelConfig):
     class TRMActionScoring(nn.Module):
         def __init__(self):
             super().__init__()
-            input_dim = 10  # viability(2) + scores(5) + uncertainty(3)
+            input_dim = 19  # viability(2) + scores(5) + uncertainty(4) + env_contacts(4) + species_contacts(4)
             hidden = max(config.dim // 2, 16)
             self.encoder = nn.Sequential(
                 nn.LayerNorm(input_dim),
@@ -446,16 +517,55 @@ def build_trm_as(config: TRMModelConfig):
             self.policy_head = nn.Linear(config.dim, 5)
             self.uncertainty_head = nn.Linear(config.dim, 5)
             self.precision_head = nn.Linear(config.dim, 1)
+            # Preserve analytic action ranking by default and let the residual head
+            # learn only the correction needed under uncertainty and viability pressure.
+            self.base_logit_scale = nn.Parameter(torch.full((5,), 4.0, dtype=torch.float32))
+            self.residual_scale = nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
 
-        def forward(self, viability_state, action_scores, uncertainty_state):
-            x = torch.cat([viability_state, action_scores, uncertainty_state], dim=-1)
+        def forward(
+            self,
+            viability_state,
+            action_scores,
+            uncertainty_state,
+            env_contact_state=None,
+            species_contact_state=None,
+        ):
+            if env_contact_state is None:
+                env_contact_state = torch.zeros(
+                    (*viability_state.shape[:-1], 4),
+                    dtype=viability_state.dtype,
+                    device=viability_state.device,
+                )
+            if species_contact_state is None:
+                species_contact_state = torch.zeros(
+                    (*viability_state.shape[:-1], 4),
+                    dtype=viability_state.dtype,
+                    device=viability_state.device,
+                )
+            x = torch.cat(
+                [
+                    viability_state,
+                    action_scores,
+                    uncertainty_state,
+                    env_contact_state,
+                    species_contact_state,
+                ],
+                dim=-1,
+            )
             latent = self.encoder(x)
-            policy_logits = self.policy_head(latent)
+            base_scale = torch.nn.functional.softplus(self.base_logit_scale)
+            base_logits = -(action_scores * base_scale)
+            base_logits = base_logits - base_logits.mean(dim=-1, keepdim=True)
+            residual_logits = self.policy_head(latent)
+            residual_scale = torch.nn.functional.softplus(self.residual_scale)
+            policy_logits = base_logits + residual_scale * residual_logits
             policy_prob = torch.softmax(policy_logits, dim=-1)
             action_uncertainty = torch.sigmoid(self.uncertainty_head(latent))
             module_precision = torch.sigmoid(self.precision_head(latent)).squeeze(-1)
             return {
                 "action_state": latent,
+                "base_logits": base_logits,
+                "residual_logits": residual_logits,
                 "policy_logits": policy_logits,
                 "policy_prob": policy_prob,
                 "action_uncertainty": action_uncertainty,
@@ -463,3 +573,172 @@ def build_trm_as(config: TRMModelConfig):
             }
 
     return TRMActionScoring()
+
+
+def build_trm_ag(config: TRMModelConfig):
+    torch, nn, _ = require_torch()
+
+    class TRMActionGating(nn.Module):
+        def __init__(self):
+            super().__init__()
+            input_dim = int(config.in_channels)
+            hidden = max(config.dim // 2, 16)
+            self.encoder = nn.Sequential(
+                nn.LayerNorm(input_dim),
+                nn.Linear(input_dim, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, config.dim),
+                nn.GELU(),
+            )
+            self.inhibition_head = nn.Linear(config.dim, 5)
+            self.control_mode_head = nn.Linear(config.dim, 3)
+            self.precision_head = nn.Linear(config.dim, 1)
+
+        def forward(self, input_view):
+            latent = self.encoder(input_view)
+            as_policy_logits = input_view[..., :5]
+            inhibition_logits = self.inhibition_head(latent)
+            inhibition_mask = torch.sigmoid(inhibition_logits)
+            control_mode_logits = self.control_mode_head(latent)
+            control_mode_prob = torch.softmax(control_mode_logits, dim=-1)
+            control_weights = control_mode_prob @ torch.tensor(
+                [
+                    [0.10, -0.05, -0.10, -0.05, 0.10],   # exploratory
+                    [0.00, 0.00, 0.00, 0.00, 0.00],      # maintenance
+                    [-0.15, 0.15, -0.20, 0.20, 0.10],    # defensive
+                ],
+                dtype=input_view.dtype,
+                device=input_view.device,
+            )
+            gated_policy_logits = as_policy_logits + control_weights - 2.25 * inhibition_mask
+            module_precision = torch.sigmoid(self.precision_head(latent)).squeeze(-1)
+            return {
+                "gating_state": latent,
+                "gating_logits": torch.zeros_like(as_policy_logits),
+                "gated_policy_logits": gated_policy_logits,
+                "inhibition_logits": inhibition_logits,
+                "inhibition_mask": inhibition_mask,
+                "control_mode_logits": control_mode_logits,
+                "control_mode_prob": control_mode_prob,
+                "module_precision": module_precision,
+            }
+
+    return TRMActionGating()
+
+
+def build_trm_bp(config: TRMModelConfig):
+    torch, nn, _ = require_torch()
+
+    class TRMBoundaryPermeabilityControl(nn.Module):
+        def __init__(self):
+            super().__init__()
+            in_channels = int(config.in_channels)
+            hidden1 = max(config.dim // 8, 16)
+            hidden2 = max(config.dim // 4, 32)
+            hidden3 = max(config.dim // 2, 64)
+            self.stem = nn.Sequential(
+                nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1),
+                nn.GELU(),
+            )
+            self.patch_head = nn.Sequential(
+                nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(hidden2, 1, kernel_size=1),
+            )
+            self.pool = nn.AdaptiveAvgPool2d(1)
+            self.latent = nn.Sequential(
+                nn.Flatten(),
+                nn.LayerNorm(hidden2),
+                nn.Linear(hidden2, hidden3),
+                nn.GELU(),
+                nn.Linear(hidden3, config.dim),
+                nn.GELU(),
+            )
+            self.interface_head = nn.Linear(config.dim, 1)
+            self.aperture_head = nn.Linear(config.dim, 1)
+            self.mode_head = nn.Linear(config.dim, 3)
+            self.precision_head = nn.Linear(config.dim, 1)
+
+        def forward(self, input_view):
+            x = input_view.permute(0, 3, 1, 2)
+            feat = self.stem(x)
+            pred_permeability_patch = torch.sigmoid(self.patch_head(feat)).permute(0, 2, 3, 1)
+            pooled = self.pool(feat)
+            state = self.latent(pooled)
+            pred_interface_gain = torch.tanh(self.interface_head(state))
+            pred_aperture_gain = torch.sigmoid(self.aperture_head(state))
+            mode_logits = self.mode_head(state)
+            mode_prob = torch.softmax(mode_logits, dim=-1)
+            mode_uncertainty = 1.0 - torch.max(mode_prob, dim=-1).values
+            module_precision = torch.sigmoid(self.precision_head(state)).squeeze(-1)
+            return {
+                "bp_state": state,
+                "pred_permeability_patch": pred_permeability_patch,
+                "pred_interface_gain": pred_interface_gain,
+                "pred_aperture_gain": pred_aperture_gain,
+                "mode_logits": mode_logits,
+                "mode_prob": mode_prob,
+                "mode_uncertainty": mode_uncertainty,
+                "module_precision": module_precision,
+            }
+
+    return TRMBoundaryPermeabilityControl()
+
+
+def build_trm_mc(config: TRMModelConfig):
+    torch, nn, _ = require_torch()
+
+    class TRMMemoryContext(nn.Module):
+        def __init__(self):
+            super().__init__()
+            input_dim = int(config.in_channels)
+            hidden = max(config.dim // 2, 32)
+            self.input_proj = nn.Sequential(
+                nn.LayerNorm(input_dim),
+                nn.Linear(input_dim, hidden),
+                nn.GELU(),
+            )
+            self.gru = nn.GRU(hidden, hidden, batch_first=True)
+            self.context_head = nn.Sequential(
+                nn.LayerNorm(hidden),
+                nn.Linear(hidden, config.dim),
+                nn.GELU(),
+            )
+            self.retrieval_head = nn.Linear(config.dim, input_dim)
+            self.action_bias_head = nn.Linear(config.dim, 5)
+            self.boundary_bias_head = nn.Linear(config.dim, 3)
+            self.precision_head = nn.Linear(config.dim, 1)
+
+        def forward(self, input_view, window_mask=None):
+            if window_mask is None:
+                window_mask = torch.ones(
+                    input_view.shape[:2],
+                    dtype=input_view.dtype,
+                    device=input_view.device,
+                )
+            x = self.input_proj(input_view)
+            seq, _ = self.gru(x)
+            lengths = torch.clamp(window_mask.sum(dim=1).long(), min=1)
+            gather_index = (lengths - 1).view(-1, 1, 1).expand(-1, 1, seq.shape[-1])
+            last_state = torch.gather(seq, 1, gather_index).squeeze(1)
+            context_state = self.context_head(last_state)
+            retrieved_context = self.retrieval_head(context_state)
+            sequence_bias = self.action_bias_head(context_state)
+            boundary_control_bias = self.boundary_bias_head(context_state)
+            module_precision = torch.sigmoid(self.precision_head(context_state)).squeeze(-1)
+            context_uncertainty = 1.0 - module_precision
+            return {
+                "context_state": context_state,
+                "retrieved_context": retrieved_context,
+                "sequence_bias": sequence_bias,
+                "boundary_control_bias": boundary_control_bias,
+                "module_precision": module_precision,
+                "context_uncertainty": context_uncertainty,
+                "window_lengths": lengths.float(),
+            }
+
+    return TRMMemoryContext()

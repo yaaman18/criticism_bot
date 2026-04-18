@@ -48,7 +48,9 @@ def _load_batch(rows: list[tuple[dict[str, Any], int]]) -> dict[str, np.ndarray]
     keys = [
         "vm_viability_state",
         "vm_contact_state",
+        "vm_species_contact_state",
         "vm_action_cost",
+        "vm_input_view",
         "vm_target_state",
         "vm_target_homeostatic_error",
         "vm_target_risk",
@@ -56,8 +58,33 @@ def _load_batch(rows: list[tuple[dict[str, Any], int]]) -> dict[str, np.ndarray]
     batch = {key: [] for key in keys}
     for meta, i in rows:
         episode = load_vm_episode(meta["path"])
-        for key in keys:
-            batch[key].append(episode[key][i])
+        env_contact = episode["vm_contact_state"][i]
+        species_contact = episode.get("vm_species_contact_state")
+        if species_contact is None:
+            species_contact_row = np.zeros(4, dtype=np.float32)
+        else:
+            species_contact_row = species_contact[i].astype(np.float32)
+        vm_input_view = episode.get("vm_input_view")
+        if vm_input_view is None:
+            vm_input_row = np.concatenate(
+                [
+                    episode["vm_viability_state"][i].astype(np.float32),
+                    env_contact.astype(np.float32),
+                    species_contact_row.astype(np.float32),
+                    episode["vm_action_cost"][i].astype(np.float32),
+                ],
+                axis=-1,
+            ).astype(np.float32)
+        else:
+            vm_input_row = vm_input_view[i].astype(np.float32)
+        batch["vm_viability_state"].append(episode["vm_viability_state"][i])
+        batch["vm_contact_state"].append(env_contact)
+        batch["vm_species_contact_state"].append(species_contact_row)
+        batch["vm_action_cost"].append(episode["vm_action_cost"][i])
+        batch["vm_input_view"].append(vm_input_row)
+        batch["vm_target_state"].append(episode["vm_target_state"][i])
+        batch["vm_target_homeostatic_error"].append(episode["vm_target_homeostatic_error"][i])
+        batch["vm_target_risk"].append(episode["vm_target_risk"][i])
     return {key: np.stack(value, axis=0).astype(np.float32) for key, value in batch.items()}
 
 
@@ -110,9 +137,13 @@ def evaluate_trm_vm(model, manifest: list[dict[str, Any]], config: TrainVmConfig
         for start in range(0, len(index), config.batch_size):
             rows = index[start : start + config.batch_size]
             batch_np = _load_batch(rows)
+            contact_state = np.concatenate(
+                [batch_np["vm_contact_state"], batch_np["vm_species_contact_state"]],
+                axis=-1,
+            ).astype(np.float32)
             outputs = model(
                 torch.from_numpy(batch_np["vm_viability_state"]).to(device),
-                torch.from_numpy(batch_np["vm_contact_state"]).to(device),
+                torch.from_numpy(contact_state).to(device),
                 torch.from_numpy(batch_np["vm_action_cost"]).to(device),
             )
             preds_state.append(outputs["viability_state"].cpu().numpy())
@@ -195,7 +226,11 @@ def train(
             batch = move_to_device({key: torch.from_numpy(value) for key, value in batch_np.items()}, device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=autocast_device, dtype=amp_dtype_obj, enabled=amp_enabled):
-                outputs = model(batch["vm_viability_state"], batch["vm_contact_state"], batch["vm_action_cost"])
+                outputs = model(
+                    batch["vm_viability_state"],
+                    torch.cat([batch["vm_contact_state"], batch["vm_species_contact_state"]], dim=-1),
+                    batch["vm_action_cost"],
+                )
                 total_loss, loss_parts = compute_trm_vm_loss(outputs, batch, train_config)
             scaler.scale(total_loss).backward()
             if grad_clip is not None and grad_clip > 0:

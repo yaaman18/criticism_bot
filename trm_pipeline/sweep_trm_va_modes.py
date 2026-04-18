@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 from .common import ensure_dir, load_json, save_json
@@ -59,6 +60,8 @@ def _compare_one_seed(
     trm_b_checkpoint: str | None,
     module_manifest: str | None,
     policy_mode: str,
+    runtime_overrides: dict | None = None,
+    env_overrides: dict | None = None,
 ) -> dict:
     output_root = ensure_dir(output_root)
     env_config = EnvironmentConfig(
@@ -66,6 +69,8 @@ def _compare_one_seed(
         hazard_patches=hazard_patches,
         shelter_patches=shelter_patches,
     )
+    if env_overrides:
+        env_config = replace(env_config, **dict(env_overrides))
     results: dict[str, dict] = {}
     for viability_mode in MODE_VALUES:
         for action_mode in MODE_VALUES:
@@ -83,6 +88,8 @@ def _compare_one_seed(
                 use_trm_b=bool(trm_b_checkpoint),
                 policy_mode=policy_mode,
             )
+            if runtime_overrides:
+                runtime_config = replace(runtime_config, **dict(runtime_overrides))
             episode_path = run_episode(
                 mode_root,
                 seed_catalog,

@@ -41,33 +41,46 @@ class TrainConfig:
     max_params: int = 7_000_000
 
 
-def load_episode(path: str | Path) -> np.ndarray:
-    with np.load(path) as data:
-        return data["multi_states"].astype(np.float32)
-
-
 def load_episode_bundle(path: str | Path) -> dict[str, np.ndarray]:
     with np.load(path) as data:
         return {key: data[key].astype(np.float32) for key in data.files}
 
 
-def build_pair_index(manifest: list[dict[str, Any]], split: str) -> list[tuple[dict[str, Any], int]]:
+def build_pair_index(
+    manifest: list[dict[str, Any]],
+    split: str,
+    input_key: str = "multi_states",
+    target_key: str = "multi_states",
+) -> list[tuple[dict[str, Any], int]]:
     index: list[tuple[dict[str, Any], int]] = []
     for row in manifest:
         if row["split"] != split:
             continue
-        for t in range(max(0, int(row["num_pairs"]))):
+        if input_key == target_key:
+            count = max(0, int(row.get("num_pairs", 0)))
+        else:
+            count = max(0, int(row.get("num_samples", row.get("num_pairs", 0))))
+        for t in range(count):
             index.append((row, t))
     return index
 
 
-def _load_pairs(rows: list[tuple[dict[str, Any], int]], start: int, stop: int) -> tuple[np.ndarray, np.ndarray]:
+def _load_pairs(
+    rows: list[tuple[dict[str, Any], int]],
+    start: int,
+    stop: int,
+    *,
+    input_key: str = "multi_states",
+    target_key: str = "multi_states",
+) -> tuple[np.ndarray, np.ndarray]:
     xs = []
     ys = []
     for row, t in rows[start:stop]:
-        states = load_episode(row["path"])
-        xs.append(states[t])
-        ys.append(states[t + 1])
+        bundle = load_episode_bundle(row["path"])
+        x_arr = bundle[input_key].astype(np.float32)
+        y_arr = bundle[target_key].astype(np.float32)
+        xs.append(x_arr[t])
+        ys.append(y_arr[t + 1] if input_key == target_key else y_arr[t])
     return np.stack(xs, axis=0), np.stack(ys, axis=0)
 
 
@@ -157,15 +170,25 @@ def _episode_regime(row: dict[str, Any], bundle: dict[str, np.ndarray]) -> str:
 
         inferred, _ = classify_regime_from_scalar_states(bundle["scalar_states"])
         return inferred
-    inferred, _ = classify_regime_from_multistates(bundle["multi_states"])
-    return inferred
+    if "multi_states" in bundle:
+        inferred, _ = classify_regime_from_multistates(bundle["multi_states"])
+        return inferred
+    return "stable"
 
 
-def evaluate_trm_a(model, manifest: list[dict[str, Any]], config: TrainConfig) -> dict[str, float]:
+def evaluate_trm_a(
+    model,
+    manifest: list[dict[str, Any]],
+    config: TrainConfig,
+    *,
+    input_key: str = "multi_states",
+    target_key: str = "multi_states",
+    baseline_key: str | None = None,
+) -> dict[str, float]:
     torch, _, _ = require_torch()
     model.eval()
     device = next(model.parameters()).device
-    val_pairs = build_pair_index(manifest, "val")
+    val_pairs = build_pair_index(manifest, "val", input_key=input_key, target_key=target_key)
     if not val_pairs:
         return {
             "val_nmse": float("nan"),
@@ -196,7 +219,13 @@ def evaluate_trm_a(model, manifest: list[dict[str, Any]], config: TrainConfig) -
     with torch.no_grad():
         for start in range(0, len(pair_subset), batch_size):
             batch_rows = pair_subset[start : start + batch_size]
-            x_np, y_np = _load_pairs(batch_rows, 0, len(batch_rows))
+            x_np, y_np = _load_pairs(
+                batch_rows,
+                0,
+                len(batch_rows),
+                input_key=input_key,
+                target_key=target_key,
+            )
             x = torch.from_numpy(x_np).to(device)
             y = torch.from_numpy(y_np).to(device)
             outputs = model(x, targets=y, use_posterior=False, sample_latent=False)
@@ -204,7 +233,17 @@ def evaluate_trm_a(model, manifest: list[dict[str, Any]], config: TrainConfig) -
             pred_logvar = outputs["pred_logvar_t1"].cpu().numpy()
             preds.append(pred)
             trues.append(y_np)
-            baselines.append(x_np)
+            if baseline_key is None:
+                baselines.append(x_np)
+            else:
+                base_np, _ = _load_pairs(
+                    batch_rows,
+                    0,
+                    len(batch_rows),
+                    input_key=baseline_key,
+                    target_key=target_key,
+                )
+                baselines.append(base_np)
             logvars.append(pred_logvar)
             halt_probs = outputs["halt_prob"].cpu().numpy()
             recursion_steps.extend(
@@ -248,20 +287,22 @@ def evaluate_trm_a(model, manifest: list[dict[str, Any]], config: TrainConfig) -
 
     rollout_rows = [row for row in manifest if row["split"] == "val"][: config.max_val_rollout_episodes]
     rollout_errors = []
-    with torch.no_grad():
-        for row in rollout_rows:
-            states = load_episode(row["path"])
-            if states.shape[0] < 10:
-                continue
-            current = torch.from_numpy(states[0:1]).to(device)
-            preds_roll = []
-            for _ in range(8):
-                outputs = model(current, use_posterior=False, sample_latent=False)
-                current = outputs["pred_state_t1"]
-                preds_roll.append(current.cpu().numpy())
-            pred_roll = np.concatenate(preds_roll, axis=0)
-            true_roll = states[1:9]
-            rollout_errors.append(nmse(pred_roll, true_roll))
+    if input_key == target_key and pred_all.shape[-1] == true_all.shape[-1]:
+        with torch.no_grad():
+            for row in rollout_rows:
+                bundle = load_episode_bundle(row["path"])
+                states = bundle[input_key]
+                if states.shape[0] < 10:
+                    continue
+                current = torch.from_numpy(states[0:1]).to(device)
+                preds_roll = []
+                for _ in range(8):
+                    outputs = model(current, use_posterior=False, sample_latent=False)
+                    current = outputs["pred_state_t1"]
+                    preds_roll.append(current.cpu().numpy())
+                pred_roll = np.concatenate(preds_roll, axis=0)
+                true_roll = states[1:9]
+                rollout_errors.append(nmse(pred_roll, true_roll))
     rollout_nmse = float(np.mean(rollout_errors)) if rollout_errors else float("nan")
     return {
         "val_nmse": float(val_nmse),
@@ -291,6 +332,9 @@ def train(
     use_amp: bool = False,
     amp_dtype: str = "float16",
     log_interval: int = 0,
+    input_key: str = "multi_states",
+    target_key: str = "multi_states",
+    baseline_key: str | None = None,
 ) -> None:
     torch, _, _ = require_torch()
     seed_everything(root_seed)
@@ -299,7 +343,7 @@ def train(
     amp_dtype_obj = amp_dtype_from_name(torch, amp_dtype)
     autocast_device = "cuda" if str(device).startswith("cuda") else "cpu"
     manifest = load_jsonl(manifest_path)
-    train_pairs = build_pair_index(manifest, "train")
+    train_pairs = build_pair_index(manifest, "train", input_key=input_key, target_key=target_key)
     if not train_pairs:
         raise SystemExit("no training pairs found")
     output_dir = ensure_dir(output_dir)
@@ -336,7 +380,13 @@ def train(
         for start in range(0, len(order), train_config.batch_size):
             batch_ids = order[start : start + train_config.batch_size]
             batch_rows = [train_pairs[i] for i in batch_ids]
-            x_np, y_np = _load_pairs(batch_rows, 0, len(batch_rows))
+            x_np, y_np = _load_pairs(
+                batch_rows,
+                0,
+                len(batch_rows),
+                input_key=input_key,
+                target_key=target_key,
+            )
             x = torch.from_numpy(x_np).to(device)
             y = torch.from_numpy(y_np).to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -369,7 +419,14 @@ def train(
                             "amp_enabled": amp_enabled,
                         }
                     )
-        eval_metrics = evaluate_trm_a(model, manifest, train_config)
+        eval_metrics = evaluate_trm_a(
+            model,
+            manifest,
+            train_config,
+            input_key=input_key,
+            target_key=target_key,
+            baseline_key=baseline_key,
+        )
         mean_train = {
             key: float(np.mean([row[key] for row in epoch_losses]))
             for key in epoch_losses[0]
@@ -401,6 +458,9 @@ def train(
             "amp_enabled": bool(amp_enabled),
             "amp_dtype": amp_dtype,
             "log_interval": int(log_interval),
+            "input_key": input_key,
+            "target_key": target_key,
+            "baseline_key": baseline_key,
         }
         torch.save(latest, checkpoint_path)
         if improved:
@@ -420,6 +480,9 @@ def train(
             "amp_requested": bool(use_amp),
             "amp_enabled": bool(amp_enabled),
             "amp_dtype": amp_dtype,
+            "input_key": input_key,
+            "target_key": target_key,
+            "baseline_key": baseline_key,
         },
     )
     print(f"saved checkpoint: {checkpoint_path}")
@@ -446,11 +509,21 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default="float16")
     parser.add_argument("--log-interval", type=int, default=0)
+    parser.add_argument("--in-channels", type=int, default=5)
+    parser.add_argument("--out-channels", type=int, default=None)
+    parser.add_argument("--input-key", default="multi_states")
+    parser.add_argument("--target-key", default="multi_states")
+    parser.add_argument("--baseline-key", default=None)
     args = parser.parse_args()
     train(
         manifest_path=args.manifest,
         output_dir=args.output_dir,
-        model_config=TRMModelConfig(z_dim=args.z_dim, max_params=args.max_params),
+        model_config=TRMModelConfig(
+            in_channels=args.in_channels,
+            out_channels=args.out_channels,
+            z_dim=args.z_dim,
+            max_params=args.max_params,
+        ),
         train_config=TrainConfig(
             batch_size=args.batch_size,
             epochs=args.epochs,
@@ -469,6 +542,9 @@ def main() -> None:
         use_amp=args.amp,
         amp_dtype=args.amp_dtype,
         log_interval=args.log_interval,
+        input_key=args.input_key,
+        target_key=args.target_key,
+        baseline_key=args.baseline_key,
     )
 
 

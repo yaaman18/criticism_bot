@@ -3,6 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
+VENV_PY="$ROOT_DIR/.venv/bin/python"
+
+if [[ ! -x "$VENV_PY" ]]; then
+  echo "Error: repo virtualenv is missing or incomplete. Run: ./scripts/bootstrap_env.sh" >&2
+  exit 1
+fi
 
 SEED_CATALOG="${SEED_CATALOG:-data/lenia_official/animals2d_seeds.json}"
 TRM_ROLLOUTS_DIR="${TRM_ROLLOUTS_DIR:-data/trm_rollouts_vast}"
@@ -19,13 +25,13 @@ LOG_INTERVAL="${LOG_INTERVAL:-50}"
 STAGE="${1:-all}"
 
 run_prepare_rollouts() {
-  python -m trm_pipeline.lenia_data \
+  "$VENV_PY" -m trm_pipeline.lenia_data \
     --seed-catalog "$SEED_CATALOG" \
     --output-root "$TRM_ROLLOUTS_DIR"
 }
 
 run_train_trm_a() {
-  python -m trm_pipeline.train_trm_a \
+  "$VENV_PY" -m trm_pipeline.train_trm_a \
     --manifest "$TRM_ROLLOUTS_DIR/manifest.jsonl" \
     --output-dir "$TRM_A_DIR" \
     --objective variational \
@@ -36,14 +42,14 @@ run_train_trm_a() {
 }
 
 run_prepare_trm_b() {
-  python -m trm_pipeline.prepare_trm_b_data \
+  "$VENV_PY" -m trm_pipeline.prepare_trm_b_data \
     --manifest "$TRM_ROLLOUTS_DIR/manifest.jsonl" \
     --checkpoint "$TRM_A_DIR/trm_a.pt" \
     --output-root "$TRM_B_CACHE_DIR"
 }
 
 run_train_trm_b() {
-  python -m trm_pipeline.train_trm_b \
+  "$VENV_PY" -m trm_pipeline.train_trm_b \
     --manifest "$TRM_B_CACHE_DIR/manifest.jsonl" \
     --output-dir "$TRM_B_DIR" \
     --device cuda \
@@ -53,7 +59,7 @@ run_train_trm_b() {
 }
 
 run_prepare_trm_va() {
-  python -m trm_pipeline.prepare_trm_va_data \
+  "$VENV_PY" -m trm_pipeline.prepare_trm_va_data \
     --seed-catalog "$SEED_CATALOG" \
     --output-root "$TRM_VA_CACHE_DIR" \
     --episodes 64 \
@@ -62,7 +68,7 @@ run_prepare_trm_va() {
 }
 
 run_train_trm_vm() {
-  python -m trm_pipeline.train_trm_vm \
+  "$VENV_PY" -m trm_pipeline.train_trm_vm \
     --manifest "$TRM_VA_CACHE_DIR/manifest.jsonl" \
     --output-dir "$TRM_VM_DIR" \
     --device cuda \
@@ -72,7 +78,7 @@ run_train_trm_vm() {
 }
 
 run_train_trm_as() {
-  python -m trm_pipeline.train_trm_as \
+  "$VENV_PY" -m trm_pipeline.train_trm_as \
     --manifest "$TRM_VA_CACHE_DIR/manifest.jsonl" \
     --output-dir "$TRM_AS_DIR" \
     --device cuda \
@@ -82,7 +88,7 @@ run_train_trm_as() {
 }
 
 run_write_manifest() {
-  python - <<'PY'
+  "$VENV_PY" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -101,7 +107,7 @@ PY
 }
 
 run_compare_modes() {
-  python -m trm_pipeline.compare_trm_va_modes \
+  "$VENV_PY" -m trm_pipeline.compare_trm_va_modes \
     --seed-catalog "$SEED_CATALOG" \
     --module-manifest "$MODULE_MANIFEST" \
     --output-root "$COMPARE_DIR"

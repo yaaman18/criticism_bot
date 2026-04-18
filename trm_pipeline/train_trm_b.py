@@ -42,21 +42,36 @@ def build_index(
     manifest: list[dict[str, Any]],
     split: str,
     skip_low_grad_frames: bool,
+    *,
+    state_key: str = "state_t",
 ) -> list[tuple[dict[str, Any], int]]:
     rows: list[tuple[dict[str, Any], int]] = []
     for meta in manifest:
         if meta["split"] != split:
             continue
         episode = load_cache_episode(meta["path"])
-        low_grad = episode["low_grad_mask"]
-        for t in range(int(meta["num_pairs"])):
+        low_grad = episode.get("low_grad_mask")
+        count = int(meta.get("num_pairs", episode[state_key].shape[0]))
+        if low_grad is None:
+            low_grad = np.zeros((count,), dtype=np.float32)
+        for t in range(count):
             if skip_low_grad_frames and bool(low_grad[t] > 0.5):
                 continue
             rows.append((meta, t))
     return rows
 
 
-def _load_batch(rows: list[tuple[dict[str, Any], int]]) -> dict[str, np.ndarray]:
+def _load_batch(
+    rows: list[tuple[dict[str, Any], int]],
+    *,
+    state_key: str = "state_t",
+    delta_key: str = "delta_state",
+    error_key: str = "error_map",
+    sensor_gate_key: str | None = None,
+    boundary_target_key: str = "boundary_target",
+    permeability_target_key: str = "permeability_target",
+    state_t1_key: str = "state_t1",
+) -> dict[str, np.ndarray]:
     data = {
         "state_t": [],
         "delta_state": [],
@@ -67,8 +82,18 @@ def _load_batch(rows: list[tuple[dict[str, Any], int]]) -> dict[str, np.ndarray]
     }
     for meta, t in rows:
         episode = load_cache_episode(meta["path"])
-        for key in data:
-            data[key].append(episode[key][t])
+        state_t = episode[state_key][t]
+        delta_state = episode[delta_key][t]
+        error_map = episode[error_key][t]
+        if sensor_gate_key is not None:
+            error_map = np.concatenate([error_map, episode[sensor_gate_key][t]], axis=-1)
+        data["state_t"].append(state_t)
+        data["delta_state"].append(delta_state)
+        data["error_map"].append(error_map)
+        data["boundary_target"].append(episode[boundary_target_key][t])
+        data["permeability_target"].append(episode[permeability_target_key][t])
+        state_t1_arr = episode.get(state_t1_key)
+        data["state_t1"].append((state_t1_arr[t] if state_t1_arr is not None else state_t).astype(np.float32))
     return {key: np.stack(value, axis=0) for key, value in data.items()}
 
 
@@ -120,11 +145,23 @@ def boundary_iou(pred: np.ndarray, target: np.ndarray) -> float:
     return inter / union
 
 
-def evaluate_trm_b(model, manifest: list[dict[str, Any]], config: TrainBConfig) -> dict[str, float]:
+def evaluate_trm_b(
+    model,
+    manifest: list[dict[str, Any]],
+    config: TrainBConfig,
+    *,
+    state_key: str = "state_t",
+    delta_key: str = "delta_state",
+    error_key: str = "error_map",
+    sensor_gate_key: str | None = None,
+    boundary_target_key: str = "boundary_target",
+    permeability_target_key: str = "permeability_target",
+    state_t1_key: str = "state_t1",
+) -> dict[str, float]:
     torch, _, _ = require_torch()
     model.eval()
     device = next(model.parameters()).device
-    index = build_index(manifest, "val", config.skip_low_grad_frames)
+    index = build_index(manifest, "val", config.skip_low_grad_frames, state_key=state_key)
     if not index:
         return {
             "boundary_iou": float("nan"),
@@ -140,7 +177,16 @@ def evaluate_trm_b(model, manifest: list[dict[str, Any]], config: TrainBConfig) 
     separations = []
     with torch.no_grad():
         for start in range(0, len(subset), batch_size):
-            batch_np = _load_batch(subset[start : start + batch_size])
+            batch_np = _load_batch(
+                subset[start : start + batch_size],
+                state_key=state_key,
+                delta_key=delta_key,
+                error_key=error_key,
+                sensor_gate_key=sensor_gate_key,
+                boundary_target_key=boundary_target_key,
+                permeability_target_key=permeability_target_key,
+                state_t1_key=state_t1_key,
+            )
             state_t = torch.from_numpy(batch_np["state_t"]).to(device)
             delta = torch.from_numpy(batch_np["delta_state"]).to(device)
             error = torch.from_numpy(batch_np["error_map"]).to(device)
@@ -178,6 +224,13 @@ def train(
     use_amp: bool = False,
     amp_dtype: str = "float16",
     log_interval: int = 0,
+    state_key: str = "state_t",
+    delta_key: str = "delta_state",
+    error_key: str = "error_map",
+    sensor_gate_key: str | None = None,
+    boundary_target_key: str = "boundary_target",
+    permeability_target_key: str = "permeability_target",
+    state_t1_key: str = "state_t1",
 ) -> None:
     torch, _, _ = require_torch()
     seed_everything(root_seed)
@@ -186,7 +239,12 @@ def train(
     amp_dtype_obj = amp_dtype_from_name(torch, amp_dtype)
     autocast_device = "cuda" if str(device).startswith("cuda") else "cpu"
     manifest = load_jsonl(manifest_path)
-    train_index = build_index(manifest, "train", train_config.skip_low_grad_frames)
+    train_index = build_index(
+        manifest,
+        "train",
+        train_config.skip_low_grad_frames,
+        state_key=state_key,
+    )
     if not train_index:
         raise SystemExit("no TRM-B training samples found")
     output_dir = ensure_dir(output_dir)
@@ -217,7 +275,16 @@ def train(
         for start in range(0, len(order), train_config.batch_size):
             batch_ids = order[start : start + train_config.batch_size]
             rows = [train_index[i] for i in batch_ids]
-            batch_np = _load_batch(rows)
+            batch_np = _load_batch(
+                rows,
+                state_key=state_key,
+                delta_key=delta_key,
+                error_key=error_key,
+                sensor_gate_key=sensor_gate_key,
+                boundary_target_key=boundary_target_key,
+                permeability_target_key=permeability_target_key,
+                state_t1_key=state_t1_key,
+            )
             batch = move_to_device({key: torch.from_numpy(value) for key, value in batch_np.items()}, device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=autocast_device, dtype=amp_dtype_obj, enabled=amp_enabled):
@@ -242,7 +309,18 @@ def train(
                             "amp_enabled": amp_enabled,
                         }
                     )
-        eval_metrics = evaluate_trm_b(model, manifest, train_config)
+        eval_metrics = evaluate_trm_b(
+            model,
+            manifest,
+            train_config,
+            state_key=state_key,
+            delta_key=delta_key,
+            error_key=error_key,
+            sensor_gate_key=sensor_gate_key,
+            boundary_target_key=boundary_target_key,
+            permeability_target_key=permeability_target_key,
+            state_t1_key=state_t1_key,
+        )
         mean_train = {
             key: float(np.mean([row[key] for row in epoch_rows]))
             for key in epoch_rows[0]
@@ -268,6 +346,13 @@ def train(
             "amp_enabled": bool(amp_enabled),
             "amp_dtype": amp_dtype,
             "log_interval": int(log_interval),
+            "state_key": state_key,
+            "delta_key": delta_key,
+            "error_key": error_key,
+            "sensor_gate_key": sensor_gate_key,
+            "boundary_target_key": boundary_target_key,
+            "permeability_target_key": permeability_target_key,
+            "state_t1_key": state_t1_key,
         }
         torch.save(latest, checkpoint_path)
         if improved:
@@ -292,11 +377,19 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default="float16")
     parser.add_argument("--log-interval", type=int, default=0)
+    parser.add_argument("--boundary-in-channels-total", type=int, default=15)
+    parser.add_argument("--state-key", default="state_t")
+    parser.add_argument("--delta-key", default="delta_state")
+    parser.add_argument("--error-key", default="error_map")
+    parser.add_argument("--sensor-gate-key", default=None)
+    parser.add_argument("--boundary-target-key", default="boundary_target")
+    parser.add_argument("--permeability-target-key", default="permeability_target")
+    parser.add_argument("--state-t1-key", default="state_t1")
     args = parser.parse_args()
     train(
         manifest_path=args.manifest,
         output_dir=args.output_dir,
-        model_config=TRMModelConfig(),
+        model_config=TRMModelConfig(boundary_in_channels_total=args.boundary_in_channels_total),
         train_config=TrainBConfig(
             batch_size=args.batch_size,
             epochs=args.epochs,
@@ -310,6 +403,13 @@ def main() -> None:
         use_amp=args.amp,
         amp_dtype=args.amp_dtype,
         log_interval=args.log_interval,
+        state_key=args.state_key,
+        delta_key=args.delta_key,
+        error_key=args.error_key,
+        sensor_gate_key=args.sensor_gate_key,
+        boundary_target_key=args.boundary_target_key,
+        permeability_target_key=args.permeability_target_key,
+        state_t1_key=args.state_t1_key,
     )
 
 

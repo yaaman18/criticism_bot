@@ -26,8 +26,10 @@ class TrainAsConfig:
     batch_size: int = 16
     epochs: int = 4
     learning_rate: float = 1e-4
+    lambda_hard_action: float = 0.25
     lambda_logits: float = 0.1
     lambda_policy_kl: float = 0.5
+    lambda_pairwise: float = 0.5
     lambda_entropy: float = 0.05
     min_policy_entropy: float = 1.0
 
@@ -55,6 +57,9 @@ def _load_batch(rows: list[tuple[dict[str, Any], int]]) -> dict[str, np.ndarray]
         "as_viability_state",
         "as_action_scores",
         "as_uncertainty_state",
+        "as_env_contact_state",
+        "as_species_contact_state",
+        "as_input_view",
         "as_target_logits",
         "as_target_policy",
         "as_target_action",
@@ -62,8 +67,39 @@ def _load_batch(rows: list[tuple[dict[str, Any], int]]) -> dict[str, np.ndarray]
     batch = {key: [] for key in keys}
     for meta, i in rows:
         episode = load_as_episode(meta["path"])
-        for key in keys:
-            batch[key].append(episode[key][i])
+        env_contact = episode.get("as_env_contact_state")
+        if env_contact is None:
+            env_contact_row = np.zeros(4, dtype=np.float32)
+        else:
+            env_contact_row = env_contact[i].astype(np.float32)
+        species_contact = episode.get("as_species_contact_state")
+        if species_contact is None:
+            species_contact_row = np.zeros(4, dtype=np.float32)
+        else:
+            species_contact_row = species_contact[i].astype(np.float32)
+        as_input_view = episode.get("as_input_view")
+        if as_input_view is None:
+            as_input_row = np.concatenate(
+                [
+                    episode["as_viability_state"][i].astype(np.float32),
+                    episode["as_action_scores"][i].astype(np.float32),
+                    episode["as_uncertainty_state"][i].astype(np.float32),
+                    env_contact_row.astype(np.float32),
+                    species_contact_row.astype(np.float32),
+                ],
+                axis=-1,
+            ).astype(np.float32)
+        else:
+            as_input_row = as_input_view[i].astype(np.float32)
+        batch["as_viability_state"].append(episode["as_viability_state"][i])
+        batch["as_action_scores"].append(episode["as_action_scores"][i])
+        batch["as_uncertainty_state"].append(episode["as_uncertainty_state"][i])
+        batch["as_env_contact_state"].append(env_contact_row)
+        batch["as_species_contact_state"].append(species_contact_row)
+        batch["as_input_view"].append(as_input_row)
+        batch["as_target_logits"].append(episode["as_target_logits"][i])
+        batch["as_target_policy"].append(episode["as_target_policy"][i])
+        batch["as_target_action"].append(episode["as_target_action"][i])
     stacked: dict[str, np.ndarray] = {}
     for key, value in batch.items():
         if key == "as_target_action":
@@ -73,10 +109,29 @@ def _load_batch(rows: list[tuple[dict[str, Any], int]]) -> dict[str, np.ndarray]
     return stacked
 
 
+def _pairwise_ranking_loss(pred_logits, target_logits):
+    torch, _, F = require_torch()
+    num_actions = int(pred_logits.shape[-1])
+    losses = []
+    for i in range(num_actions):
+        for j in range(i + 1, num_actions):
+            target_diff = target_logits[:, i] - target_logits[:, j]
+            sign = torch.sign(target_diff)
+            valid = sign != 0
+            if not torch.any(valid):
+                continue
+            pred_diff = pred_logits[:, i] - pred_logits[:, j]
+            losses.append(F.softplus(-sign[valid] * pred_diff[valid]).mean())
+    if not losses:
+        return pred_logits.new_tensor(0.0)
+    return torch.stack(losses).mean()
+
+
 def compute_trm_as_loss(outputs, batch, config: TrainAsConfig):
     torch, _, F = require_torch()
     loss_policy = F.cross_entropy(outputs["policy_logits"], batch["as_target_action"])
     loss_logits = F.mse_loss(outputs["policy_logits"], batch["as_target_logits"])
+    loss_pairwise = _pairwise_ranking_loss(outputs["policy_logits"], batch["as_target_logits"])
     target_policy = torch.clamp(batch["as_target_policy"], min=1e-8, max=1.0)
     pred_log_policy = torch.log_softmax(outputs["policy_logits"], dim=-1)
     loss_policy_kl = F.kl_div(pred_log_policy, target_policy, reduction="batchmean")
@@ -84,14 +139,16 @@ def compute_trm_as_loss(outputs, batch, config: TrainAsConfig):
     entropy = -torch.sum(pred_policy * torch.log(torch.clamp(pred_policy, min=1e-8, max=1.0)), dim=-1)
     loss_entropy = torch.relu(torch.tensor(config.min_policy_entropy, device=entropy.device) - entropy.mean())
     total = (
-        loss_policy
+        config.lambda_hard_action * loss_policy
         + config.lambda_logits * loss_logits
         + config.lambda_policy_kl * loss_policy_kl
+        + config.lambda_pairwise * loss_pairwise
         + config.lambda_entropy * loss_entropy
     )
     return total, {
         "loss_policy": float(loss_policy.detach().cpu().item()),
         "loss_logits": float(loss_logits.detach().cpu().item()),
+        "loss_pairwise": float(loss_pairwise.detach().cpu().item()),
         "loss_policy_kl": float(loss_policy_kl.detach().cpu().item()),
         "loss_entropy": float(loss_entropy.detach().cpu().item()),
     }
@@ -140,6 +197,8 @@ def evaluate_trm_as(model, manifest: list[dict[str, Any]], config: TrainAsConfig
                 torch.from_numpy(batch_np["as_viability_state"]).to(device),
                 torch.from_numpy(batch_np["as_action_scores"]).to(device),
                 torch.from_numpy(batch_np["as_uncertainty_state"]).to(device),
+                torch.from_numpy(batch_np["as_env_contact_state"]).to(device),
+                torch.from_numpy(batch_np["as_species_contact_state"]).to(device),
             )
             pred_logits_rows.append(outputs["policy_logits"].cpu().numpy())
             pred_policy_rows.append(outputs["policy_prob"].cpu().numpy())
@@ -222,13 +281,21 @@ def train(
                 "as_viability_state": torch.from_numpy(batch_np["as_viability_state"]),
                 "as_action_scores": torch.from_numpy(batch_np["as_action_scores"]),
                 "as_uncertainty_state": torch.from_numpy(batch_np["as_uncertainty_state"]),
+                "as_env_contact_state": torch.from_numpy(batch_np["as_env_contact_state"]),
+                "as_species_contact_state": torch.from_numpy(batch_np["as_species_contact_state"]),
                 "as_target_logits": torch.from_numpy(batch_np["as_target_logits"]),
                 "as_target_policy": torch.from_numpy(batch_np["as_target_policy"]),
                 "as_target_action": torch.from_numpy(batch_np["as_target_action"]),
             }, device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=autocast_device, dtype=amp_dtype_obj, enabled=amp_enabled):
-                outputs = model(batch["as_viability_state"], batch["as_action_scores"], batch["as_uncertainty_state"])
+                outputs = model(
+                    batch["as_viability_state"],
+                    batch["as_action_scores"],
+                    batch["as_uncertainty_state"],
+                    batch["as_env_contact_state"],
+                    batch["as_species_contact_state"],
+                )
                 total_loss, loss_parts = compute_trm_as_loss(outputs, batch, train_config)
             scaler.scale(total_loss).backward()
             if grad_clip is not None and grad_clip > 0:

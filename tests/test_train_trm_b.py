@@ -51,6 +51,32 @@ def _cache_episode(tmp_path: Path, low_grad_mask: np.ndarray | None = None) -> t
     return episode_path, meta
 
 
+def _multispecies_bd_cache_episode(tmp_path: Path) -> tuple[Path, dict]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    image_size = 32
+    num_pairs = 4
+    rng = np.random.default_rng(7)
+    episode_path = tmp_path / "cache_episode_multispecies.npz"
+    np.savez_compressed(
+        episode_path,
+        bd_observation=rng.random((num_pairs, image_size, image_size, 11), dtype=np.float32),
+        bd_world_error=rng.random((num_pairs, image_size, image_size, 11), dtype=np.float32),
+        bd_sensor_gate=rng.random((num_pairs, image_size, image_size, 1), dtype=np.float32),
+        bd_delta_observation=rng.random((num_pairs, image_size, image_size, 11), dtype=np.float32),
+        bd_boundary_target=rng.random((num_pairs, image_size, image_size, 1), dtype=np.float32),
+        bd_permeability_target=rng.random((num_pairs, image_size, image_size, 1), dtype=np.float32),
+        low_grad_mask=np.zeros((num_pairs,), dtype=np.float32),
+    )
+    meta = {
+        "episode_id": "cache_ep_multi_0001",
+        "split": "val",
+        "path": str(episode_path),
+        "num_pairs": num_pairs,
+        "seed_id": "seed_multi_0001",
+    }
+    return episode_path, meta
+
+
 def test_boundary_iou_matches_expected_overlap() -> None:
     pred = np.array([[[1.0], [1.0]], [[0.0], [0.0]]], dtype=np.float32)
     target = np.array([[[1.0], [0.0]], [[0.0], [0.0]]], dtype=np.float32)
@@ -139,6 +165,50 @@ def test_train_trm_b_smoke_writes_checkpoint_and_metrics(tmp_path: Path) -> None
     checkpoint = torch.load(output_dir / "trm_b.pt", map_location="cpu")
     assert checkpoint["amp_requested"] is True
     assert checkpoint["amp_enabled"] is False
+
+
+def test_train_trm_b_multispecies_bd_view_smoke(tmp_path: Path) -> None:
+    _, train_meta = _multispecies_bd_cache_episode(tmp_path / "train_cache_multi")
+    train_meta["split"] = "train"
+    _, val_meta = _multispecies_bd_cache_episode(tmp_path / "val_cache_multi")
+    val_meta["split"] = "val"
+    manifest_path = tmp_path / "manifest_multi.jsonl"
+    manifest_path.write_text(
+        json.dumps(train_meta, ensure_ascii=False) + "\n" + json.dumps(val_meta, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "trm_b_multi_out"
+
+    train(
+        manifest_path=manifest_path,
+        output_dir=output_dir,
+        model_config=TRMModelConfig(
+            image_size=32,
+            patch_size=8,
+            dim=32,
+            recursions=2,
+            num_heads=4,
+            mlp_ratio=2,
+            boundary_in_channels_total=34,
+        ),
+        train_config=TrainBConfig(batch_size=2, epochs=1, learning_rate=1e-4),
+        root_seed=123,
+        use_amp=True,
+        log_interval=1,
+        state_key="bd_observation",
+        delta_key="bd_delta_observation",
+        error_key="bd_world_error",
+        sensor_gate_key="bd_sensor_gate",
+        boundary_target_key="bd_boundary_target",
+        permeability_target_key="bd_permeability_target",
+    )
+
+    checkpoint = torch.load(output_dir / "trm_b.pt", map_location="cpu")
+    metrics = json.loads((output_dir / "trm_b_metrics_latest.json").read_text(encoding="utf-8"))
+    assert checkpoint["state_key"] == "bd_observation"
+    assert checkpoint["error_key"] == "bd_world_error"
+    assert checkpoint["sensor_gate_key"] == "bd_sensor_gate"
+    assert np.isfinite(metrics["boundary_iou"])
 
 
 def test_train_trm_b_can_resume_from_checkpoint(tmp_path: Path) -> None:

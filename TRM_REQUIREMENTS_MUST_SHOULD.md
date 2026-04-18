@@ -1416,3 +1416,507 @@ dead_t = death(v_{t+1})
 
 - 現在の ERIE 段階では、古細菌データは `主学習データ` ではなく `設計根拠 + 補助検証 + 将来導入候補` として扱うのが妥当であること。
 - 現在ただちに行うべきことは、古細菌データを runtime 教師へ投入することではなく、`viability`, `finite existence`, `boundary maintenance`, `environmental dependence` をどう写像するかの文書化であること。
+
+---
+
+## 42. Production Dataset Scale and Generation Plan
+
+This section defines the minimum production-scale dataset design that MUST exist
+before substantial rented GPU time such as VastAI is used for TRM pretraining.
+
+### MUST
+
+- GPU rental MUST NOT be used primarily to compensate for an underspecified or
+  under-sized dataset.
+- Production data MUST be separated into at least the following families:
+  - `Family A`: world / boundary pretraining data
+  - `Family B`: runtime bootstrap data
+- Production dataset readiness MUST be defined in terms of:
+  - successful retained episodes
+  - seed-disjoint splits
+  - effective frame/step supervision count
+  and not by raw file count alone.
+- Smoke datasets MUST NOT be treated as production datasets.
+- Minimum production thresholds defined in this section MUST be interpreted
+  together with
+  [IDEAL_DATA_CRITERIA.md](/Users/yamaguchimitsuyuki/criticism_bot/IDEAL_DATA_CRITERIA.md),
+  which defines the higher-level target for behaviorally dense data.
+
+### SHOULD
+
+- Dataset planning SHOULD be conservative enough that one failed VastAI run does
+  not require redesign of the dataset itself.
+- The first production-scale dataset SHOULD be intentionally moderate and
+  expandable, not maximal.
+
+### 42.1 Dataset Families
+
+#### Family A: World / Boundary Pretraining
+
+Purpose:
+
+- pretrain `TRM-Wp`
+- pretrain `TRM-Bd`
+- optionally serve as upstream data for future `TRM-Bp`
+
+Primary source:
+
+- `data/lenia_official/animals2d_seeds.json`
+- Lenia rollouts from `trm_pipeline.lenia_data`
+
+Primary retained unit:
+
+- one successful Lenia episode after warmup
+
+Derived supervision units:
+
+- one-step pairs `(S_t, S_(t+1))`
+- boundary pseudo-label supervision pairs
+
+#### Family B: Runtime Bootstrap
+
+Purpose:
+
+- bootstrap `TRM-Vm`
+- bootstrap `TRM-As`
+
+Primary source:
+
+- ERIE runtime rollouts on top of Lenia
+- `resource / hazard / shelter` fields
+- analytic or assistive teacher traces
+
+Primary retained unit:
+
+- one runtime episode
+
+Derived supervision units:
+
+- one per-step viability supervision sample
+- one per-step action-scoring supervision sample
+
+### 42.2 Production Minimum for Family A
+
+The first production `TRM-Wp / TRM-Bd` dataset MUST satisfy all of the
+following.
+
+- attempted source seeds:
+  - at least `240`
+- retained successful episodes:
+  - at least `192`
+- split:
+  - train: `144`
+  - val: `24`
+  - test: `24`
+- split rule:
+  - splits MUST be seed-disjoint
+  - the same `seed_id` MUST NOT appear in more than one split
+- rollout length:
+  - `warmup_steps = 32`
+  - `record_steps = 256`
+- effective one-step sample count:
+  - SHOULD be at least `49k`
+    - approximately `192 * 255`
+
+If fewer than `192` successful episodes are retained, the dataset build MUST be
+regenerated before longer training runs are attempted.
+
+### 42.3 Production Minimum for Family B
+
+The first production `TRM-Vm / TRM-As` bootstrap dataset MUST satisfy all of
+the following.
+
+- source seeds:
+  - at least `96`
+- runtime modes:
+  - MUST include:
+    - `closed_loop`
+    - `random`
+    - `no_action`
+- retained runtime episodes:
+  - at least `192`
+- preferred expansion target:
+  - `288` to `384` retained runtime episodes
+- episode length:
+  - `warmup_steps = 4`
+  - `steps >= 24`
+- effective per-step supervision count:
+  - SHOULD be at least `4.5k`
+  - preferably `6k+`
+
+### 42.4 Runtime Mode Composition for Family B
+
+Family B MUST NOT be built from `closed_loop` only.
+
+Initial target composition SHOULD be:
+
+- `closed_loop`: `50%`
+- `random`: `30%`
+- `no_action`: `20%`
+
+This composition exists to avoid teacher collapse in `TRM-As` and to provide
+both competent and degraded trajectories for `TRM-Vm`.
+
+### 42.5 Success / Failure Mix for Family B
+
+Family B MUST include both successful and failing trajectories.
+
+Initial target:
+
+- non-dead terminal episodes: `55%` to `80%`
+- dead terminal episodes: `20%` to `45%`
+
+The dataset build SHOULD be rejected and regenerated if:
+
+- almost all trajectories survive
+- almost all trajectories die
+
+because either extreme weakens the bootstrap signal for viability and action
+learning.
+
+### 42.6 Regime Balance for Family A
+
+Family A SHOULD preserve both relatively stable and more chaotic Lenia regimes.
+
+Minimum requirement:
+
+- neither `stable` nor `chaotic` MAY exceed `85%` of the retained dataset
+
+Preferred target:
+
+- `stable`: `55%` to `75%`
+- `chaotic`: `25%` to `45%`
+
+This is an engineering diversity requirement, not a metaphysical claim about
+Lenia.
+
+### 42.7 Action Distribution Quality for Family B
+
+The `TRM-As` bootstrap dataset MUST be checked before expensive training.
+
+The retained dataset SHOULD satisfy all of the following.
+
+- all five actions MUST appear
+- no single action SHOULD exceed `55%` of the retained step-level targets
+- policy entropy mean SHOULD remain above `1.0`
+- dead trajectories SHOULD contain at least two distinct dominant actions across
+  the dataset
+
+If these conditions fail, the bootstrap dataset SHOULD be regenerated before
+longer `TRM-As` training runs.
+
+### 42.8 Concrete Generation Procedure for Family A
+
+The recommended generation procedure for the first production `TRM-Wp/Bd`
+dataset is:
+
+1. select `240` seeds from `animals2d_seeds.json`
+2. generate Lenia rollouts with:
+   - `image_size = 64`
+   - `target_radius = 12`
+   - `warmup_steps = 32`
+   - `record_steps = 256`
+3. reject failed or degenerate episodes with the existing scalar rejection
+   rules
+4. classify each retained episode into regime classes
+5. split by `seed_id`
+6. persist:
+   - per-episode `.npz`
+   - `manifest.jsonl`
+   - summary with retained counts and regime balance
+
+### 42.9 Concrete Generation Procedure for Family B
+
+The recommended generation procedure for the first production `TRM-Vm/As`
+dataset is:
+
+1. select at least `96` seeds
+2. run ERIE runtime under at least two mode assignments drawn from:
+   - `closed_loop`
+   - `random`
+   - `no_action`
+3. retain step-level bootstrap targets for viability and action scoring
+4. measure:
+   - survival ratio
+   - action histogram
+   - mean policy entropy
+   - dead vs non-dead ratio
+5. reject builds that are heavily collapsed
+6. persist:
+   - per-episode `.npz`
+   - `manifest.jsonl`
+   - summary with mode composition and action distribution
+
+### 42.10 Local Acceptance Before VastAI
+
+Before substantial rented GPU time is used, all of the following MUST hold.
+
+- Family A production build exists and contains at least `192` retained
+  successful episodes
+- Family B production build exists and contains at least `192` retained runtime
+  episodes
+- manifests are valid and non-empty
+- seed-disjoint split integrity has been verified
+- at least one local short training run can read the production manifests
+  without schema or shape errors
+- at least one local compare run can read the resulting checkpoints and produce
+  a summary
+
+### 42.11 What Does NOT Count as a Production Dataset
+
+The following MUST NOT be treated as sufficient production data.
+
+- smoke datasets with only `2` to `8` retained episodes
+- datasets built from a single runtime mode only
+- datasets whose trajectories are almost all success or almost all failure
+- datasets split by frame instead of by `seed_id`
+- datasets where action labels are nearly deterministic due to teacher collapse
+
+---
+
+## 43. High-Information-Density Environment Variable Requirements
+
+This section defines how the Lenia-side environment MUST be enriched when the
+goal is to maximize behavioral information density for ERIE rather than merely
+produce smooth motion.
+
+### 43.1 Principle
+
+### MUST
+
+- Environment variables MUST be chosen so that different actions produce
+  materially different viability outcomes.
+- Environment variables MUST create genuine tradeoffs rather than a single
+  dominant strategy.
+- The environment MUST remain interpretable in terms of viability and boundary
+  maintenance.
+- The environment MUST NOT collapse into a simple reward field.
+
+### SHOULD
+
+- The environment SHOULD be abstracted from hydrothermal-vent logic rather than
+  generic game-style resource/hazard mechanics.
+- Environment variables SHOULD be selected so that:
+  - `approach`
+  - `withdraw`
+  - `intake`
+  - `seal`
+  - `reconfigure`
+  each becomes useful under some regime.
+
+### 43.2 Core Variable Set
+
+The preferred high-information-density environment SHOULD replace the overly
+generic `resource / hazard / shelter` abstraction with the following four
+fields.
+
+#### 43.2.1 `energy_gradient_field`
+
+Meaning:
+
+- usable chemical or thermodynamic gradient
+- the main positive source for `G_t`
+
+Why it is needed:
+
+- creates directional value for `approach`
+- makes `intake` meaningful
+- allows local abundance without global safety
+
+Runtime interpretation:
+
+- higher values increase energy gain if the boundary is open enough
+- high gain SHOULD come with some cost or exposure
+
+#### 43.2.2 `thermal_stress_field`
+
+Meaning:
+
+- environmental intensity that damages structure when too high
+
+Why it is needed:
+
+- prevents the trivial solution "always move toward maximum energy"
+- creates a natural vent-core vs habitable-band tradeoff
+
+Runtime interpretation:
+
+- high values SHOULD increase boundary degradation
+- high values MAY also increase observation noise or action cost
+
+#### 43.2.3 `toxicity_field`
+
+Meaning:
+
+- chemically harmful or corrosive exposure independent from temperature
+
+Why it is needed:
+
+- separates "energetic but harsh" from "toxic but not necessarily hot"
+- makes withdrawal and selective sealing more meaningful
+
+Runtime interpretation:
+
+- high values SHOULD damage `B_t`
+- high values MAY reduce the effective benefit of `intake`
+
+#### 43.2.4 `niche_stability_field`
+
+Meaning:
+
+- local conditions that help maintain structure, sensing, or controlled exchange
+
+Why it is needed:
+
+- creates protected bands or pockets rather than only punishment zones
+- gives `reconfigure` and `seal` a context where they genuinely help
+
+Runtime interpretation:
+
+- higher values SHOULD reduce effective degradation of `B_t`
+- higher values MAY reduce observation noise or uncertainty drift
+
+### 43.3 Optional Secondary Variables
+
+The following secondary variables MAY be added later if the four-field system is
+still too low in informational richness.
+
+- `flow_shear_field`
+  - directional transport stress
+  - useful if body orientation or aperture orientation becomes more important
+- `mineral_substrate_field`
+  - attachment / anchoring affordance
+  - useful if body localization or "staying in the band" matters
+- `signal_visibility_field`
+  - observation quality modifier
+  - useful if epistemic action remains too weak
+
+These variables SHOULD NOT be introduced before the four-field core is tested.
+
+### 43.4 Mapping to Viability Variables
+
+The high-information-density environment MUST influence viability variables in a
+nontrivial but interpretable way.
+
+Preferred initial mapping:
+
+- `energy_gradient_field`
+  - positive effect on `G_t`
+- `thermal_stress_field`
+  - negative effect on `B_t`
+  - optional negative effect on sensing reliability
+- `toxicity_field`
+  - negative effect on `B_t`
+  - optional negative effect on `G_t`
+- `niche_stability_field`
+  - positive effect on `B_t`
+  - optional reduction of uncertainty drift
+
+This mapping SHOULD be implemented so that no single field fully determines
+survival on its own.
+
+### 43.5 Mapping to Action Semantics
+
+The action vocabulary MUST remain the same initially, but its meaning SHOULD be
+reinterpreted in terms of the new fields.
+
+- `approach`
+  - move toward locally favorable energy gradients
+  - may also increase exposure to thermal stress or toxicity
+- `withdraw`
+  - reduce exposure to thermal or toxic regions
+  - may also move away from usable energy
+- `intake`
+  - exploit `energy_gradient_field` through the boundary
+  - SHOULD be less effective when toxicity is high
+- `seal`
+  - reduce structural damage from `thermal_stress_field` and `toxicity_field`
+  - SHOULD also reduce immediate intake efficiency
+- `reconfigure`
+  - shift aperture / permeability / contact geometry to search for a viable band
+  - SHOULD carry an immediate cost but improve future exposure
+
+### 43.6 Required Spatial Structure
+
+The environment MUST NOT be spatially trivial.
+
+At minimum, the environment SHOULD contain:
+
+- one or more high-energy zones
+- one or more high-stress zones
+- one or more relatively stable niches
+- at least one spatial region where two or more of these overlap
+
+The preferred structure is vent-like:
+
+- near-core:
+  - high energy
+  - high thermal stress
+  - possibly high toxicity
+- habitable band:
+  - moderate energy
+  - manageable stress
+  - useful niche stability
+- distal zone:
+  - low stress
+  - low usable energy
+
+This structure SHOULD create a real dilemma rather than a simple best location.
+
+### 43.7 Information-Density Criteria
+
+An environment configuration SHOULD be considered information-dense only if all
+of the following hold in evaluation.
+
+- different actions produce measurably different `G_{t+1}, B_{t+1}` forecasts
+- no single action dominates across almost all states
+- at least two distinct failure modes occur across episodes
+- at least two distinct recovery patterns occur across episodes
+- `closed_loop` materially outperforms `no_action`
+- `closed_loop` is not equivalent to a degenerate `intake + seal` fixed pattern
+
+### 43.8 Quantitative Acceptance Heuristics
+
+The following heuristics MAY be used as initial operational thresholds.
+
+- action diversity:
+  - at least `4/5` actions SHOULD appear across a representative evaluation run
+- dominant action cap:
+  - no single action SHOULD exceed `65%` of selected actions over the evaluated
+    set
+- viability sensitivity:
+  - the standard deviation of predicted next-step homeostatic change across the
+    action set SHOULD exceed a small positive threshold under nonterminal states
+- failure diversity:
+  - at least two of the following SHOULD appear:
+    - energy-depletion failures
+    - boundary-collapse failures
+    - mixed failures
+
+### 43.9 What Counts as a Bad Variable Set
+
+The environment variable design MUST be revised if any of the following is
+observed.
+
+- `approach` is always correct
+- `withdraw` is never selected
+- `intake` is always profitable regardless of exposure
+- `seal` is always profitable regardless of energy state
+- `reconfigure` is never useful
+- trajectories are visually active but viability outcomes barely differ by
+  action
+
+### 43.10 Recommended Initial Implementation Order
+
+The implementation order SHOULD be:
+
+1. reinterpret existing `resource` as `energy_gradient_field`
+2. split existing `hazard` into:
+   - `thermal_stress_field`
+   - `toxicity_field`
+3. reinterpret existing `shelter` as `niche_stability_field`
+4. update viability equations and policy proxies
+5. regenerate runtime bootstrap data
+6. retrain `TRM-Vm` and `TRM-As`
+
+This order minimizes disruption while increasing behavioral information density.

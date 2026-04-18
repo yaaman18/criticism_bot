@@ -13,6 +13,11 @@ This taxonomy is broader than the currently implemented set. It is a design
 document for future extension, not a statement that every TRM below must be
 implemented immediately.
 
+For the library-level organization and brain-inspired module-bank strategy, see
+[TRM_LIBRARY_DESIGN.md](/Users/yamaguchimitsuyuki/criticism_bot/TRM_LIBRARY_DESIGN.md).
+For the concrete input slicing policy per TRM, see
+[TRM_INPUT_VIEW_SPEC.md](/Users/yamaguchimitsuyuki/criticism_bot/TRM_INPUT_VIEW_SPEC.md).
+
 ## 2. Design Rules
 
 ### MUST

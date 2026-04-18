@@ -17,14 +17,14 @@ def _vm_manifest(tmp_path: Path) -> Path:
     for split, episode_id in (("train", "vm_train"), ("val", "vm_val")):
         n = 8
         viability = rng.uniform(0.2, 0.9, size=(n, 2)).astype(np.float32)
-        contacts = rng.uniform(0.0, 1.0, size=(n, 3)).astype(np.float32)
+        contacts = rng.uniform(0.0, 1.0, size=(n, 4)).astype(np.float32)
         cost = rng.uniform(0.0, 0.03, size=(n, 1)).astype(np.float32)
         target_state = np.clip(
             viability
             + np.stack(
                 [
                     0.08 * contacts[:, 0] - 0.03 * cost[:, 0],
-                    -0.05 * contacts[:, 1] + 0.04 * contacts[:, 2],
+                    -0.04 * contacts[:, 1] - 0.03 * contacts[:, 2] + 0.04 * contacts[:, 3],
                 ],
                 axis=-1,
             ),
