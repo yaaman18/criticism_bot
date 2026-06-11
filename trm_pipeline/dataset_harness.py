@@ -11,10 +11,21 @@ import sys
 from typing import Any
 
 from .common import append_jsonl, ensure_dir, load_json, load_jsonl, save_json, save_jsonl
-from .erie_runtime import ACTIONS, EnvironmentConfig, RuntimeConfig
+from .erie_runtime import (
+    ACTIONS,
+    EnvironmentConfig,
+    RuntimeConfig,
+    add_environment_config_args,
+    environment_config_from_args,
+)
 from .experiment_harness import run_doctor
 from .lenia_data import RolloutConfig, generate_rollouts
-from .prepare_trm_va_data import EPISODE_FAMILIES, prepare_trm_va_cache
+from .prepare_trm_va_data import (
+    EPISODE_FAMILIES,
+    EXTERNAL_CONTACT_FIELDS,
+    prepare_trm_va_cache,
+    write_role_view_manifests,
+)
 
 
 DATASET_KIND_PASSIVE = "passive_lenia_pretrain"
@@ -114,6 +125,8 @@ def _preset_overrides(preset: str) -> dict[str, Any]:
                 "min_recovery_fraction": 0.55,
                 "min_stress_defensive_fraction": 0.40,
                 "max_stress_exploit_fraction": 0.55,
+                "require_external_state_gate": True,
+                "min_external_contact_std": 0.001,
             },
         }
     if preset == "agentic_production":
@@ -160,6 +173,8 @@ def _preset_overrides(preset: str) -> dict[str, Any]:
                 "min_recovery_fraction": 0.55,
                 "min_stress_defensive_fraction": 0.40,
                 "max_stress_exploit_fraction": 0.55,
+                "require_external_state_gate": True,
+                "min_external_contact_std": 0.001,
             },
         }
     raise SystemExit(f"unknown dataset preset: {preset}")
@@ -226,11 +241,17 @@ def _entropy_ratio(counts: list[int]) -> float:
     return float(entropy / math.log(len(counts)))
 
 
-def _parse_mode_mix(entries: list[str] | None) -> dict[str, float] | None:
+def _parse_mode_mix(entries: list[str] | list[list[str]] | None) -> dict[str, float] | None:
     if not entries:
         return None
-    parsed: dict[str, float] = {}
+    flattened: list[str] = []
     for entry in entries:
+        if isinstance(entry, (list, tuple)):
+            flattened.extend(str(value) for value in entry)
+        else:
+            flattened.append(str(entry))
+    parsed: dict[str, float] = {}
+    for entry in flattened:
         if "=" not in str(entry):
             raise SystemExit(f"invalid policy mode mix entry: {entry}")
         name, raw_value = str(entry).split("=", 1)
@@ -278,6 +299,59 @@ def _weighted_mean(rows: list[tuple[float | None, int]]) -> float | None:
     if denominator <= 0:
         return None
     return float(numerator / denominator)
+
+
+def _weighted_field_mean(
+    rows: list[tuple[dict[str, Any], int]],
+    *,
+    section: str,
+) -> dict[str, float]:
+    accum: dict[str, float] = {}
+    weights: dict[str, int] = {}
+    for payload, weight in rows:
+        if weight <= 0:
+            continue
+        values = dict(payload.get(section, {}))
+        for field, raw_value in values.items():
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                continue
+            key = str(field)
+            accum[key] = float(accum.get(key, 0.0) + value * int(weight))
+            weights[key] = int(weights.get(key, 0) + int(weight))
+    return {
+        key: float(accum[key] / weights[key])
+        for key in sorted(accum)
+        if int(weights.get(key, 0)) > 0
+    }
+
+
+def _merge_external_contact_summaries(
+    rows: list[tuple[dict[str, Any], int]],
+) -> dict[str, Any]:
+    fields: list[str] = []
+    num_samples = 0
+    for payload, weight in rows:
+        for field in list(payload.get("fields", [])):
+            name = str(field)
+            if name not in fields:
+                fields.append(name)
+        raw_samples = payload.get("num_samples")
+        try:
+            num_samples += int(raw_samples)
+        except (TypeError, ValueError):
+            num_samples += max(0, int(weight))
+    std = _weighted_field_mean(rows, section="std")
+    return {
+        "fields": fields,
+        "mean": _weighted_field_mean(rows, section="mean"),
+        "std": std,
+        "min_std": float(min(std.values())) if std else 0.0,
+        "num_samples": int(num_samples),
+    }
 
 
 def _default_passive_acceptance(num_seeds: int, record_steps: int) -> dict[str, Any]:
@@ -492,12 +566,25 @@ def build_dataset_contract(
     image_size: int = 64,
     target_radius: int = 12,
     root_seed: int = 20260306,
+    mu_min: float = 0.23,
+    mu_max: float = 0.41,
+    sigma_min: float = 0.033,
+    sigma_max: float = 0.080,
+    center_mu_min: float = 0.27,
+    center_mu_max: float = 0.38,
+    center_sigma_min: float = 0.039,
+    center_sigma_max: float = 0.067,
+    center_sampling_ratio: float = 0.7,
+    max_attempts_per_seed: int = 12,
     episodes: int = 16,
     steps: int = 32,
     runtime_seed: int = 20260318,
     target_band_weight: float = 0.0,
     target_g_overshoot_weight: float = 0.0,
     defensive_family_bias: float = 0.0,
+    resource_patches: int = 3,
+    hazard_patches: int = 3,
+    shelter_patches: int = 1,
     policy_mode_mix: dict[str, float] | None = None,
     max_attempt_multiplier: int = 4,
     min_episode_samples: int = 8,
@@ -551,6 +638,16 @@ def build_dataset_contract(
                 "image_size": int(image_size),
                 "target_radius": int(target_radius),
                 "root_seed": int(root_seed),
+                "mu_min": float(mu_min),
+                "mu_max": float(mu_max),
+                "sigma_min": float(sigma_min),
+                "sigma_max": float(sigma_max),
+                "center_mu_min": float(center_mu_min),
+                "center_mu_max": float(center_mu_max),
+                "center_sigma_min": float(center_sigma_min),
+                "center_sigma_max": float(center_sigma_max),
+                "center_sampling_ratio": float(center_sampling_ratio),
+                "max_attempts_per_seed": int(max_attempts_per_seed),
             },
         }
         merged_acceptance = _default_passive_acceptance(int(num_seeds), int(record_steps))
@@ -570,6 +667,9 @@ def build_dataset_contract(
                 "target_band_weight": float(target_band_weight),
                 "target_g_overshoot_weight": float(target_g_overshoot_weight),
                 "defensive_family_bias": float(defensive_family_bias),
+                "resource_patches": int(resource_patches),
+                "hazard_patches": int(hazard_patches),
+                "shelter_patches": int(shelter_patches),
                 "policy_mode_mix": dict(policy_mode_mix or {"closed_loop": 1.0}),
                 "max_attempt_multiplier": int(max_attempt_multiplier),
                 "min_episode_samples": int(min_episode_samples),
@@ -824,6 +924,24 @@ def _evaluate_agentic_dataset(contract: dict[str, Any], dataset_root: Path) -> d
         if bool(row.get("terminal_dead", row.get("quality", {}).get("terminal_dead", False)))
     }
     dead_dominant_action_diversity = len([value for value in dead_dominant_actions if value and value != "None"])
+    external_contact = dict(summary.get("external_state_contact", {}))
+    external_fields = list(summary.get("external_state_fields", external_contact.get("fields", [])))
+    external_std = {
+        str(field): float(value)
+        for field, value in dict(external_contact.get("std", {})).items()
+        if isinstance(value, (int, float))
+    }
+    required_external_fields = list(acceptance.get("required_external_fields", EXTERNAL_CONTACT_FIELDS))
+    missing_external_fields = [field for field in required_external_fields if field not in external_fields]
+    canonical_environment_config_present = all(
+        "environment_config_canonical" in row for row in rows
+    )
+    if "min_std" in external_contact:
+        min_external_contact_std = float(external_contact.get("min_std", float("nan")))
+    elif external_std:
+        min_external_contact_std = float(min(external_std.values()))
+    else:
+        min_external_contact_std = float("nan")
 
     criteria = {
         "retained_episodes": _criterion(
@@ -974,6 +1092,29 @@ def _evaluate_agentic_dataset(contract: dict[str, Any], dataset_root: Path) -> d
             expected=float(acceptance["min_dead_dominant_action_diversity"]),
             comparator=">=",
         )
+    if acceptance.get("require_external_state_gate"):
+        criteria["external_state_fields_present"] = _criterion(
+            name="external_state_fields_present",
+            passed=not missing_external_fields,
+            actual=float(len(required_external_fields) - len(missing_external_fields)),
+            expected=float(len(required_external_fields)),
+            comparator="==",
+        )
+        criteria["external_state_contact_variability"] = _criterion(
+            name="external_state_contact_variability",
+            passed=math.isfinite(min_external_contact_std)
+            and min_external_contact_std >= float(acceptance.get("min_external_contact_std", 0.0)),
+            actual=min_external_contact_std,
+            expected=float(acceptance.get("min_external_contact_std", 0.0)),
+            comparator=">=",
+        )
+        criteria["environment_config_canonical_present"] = _criterion(
+            name="environment_config_canonical_present",
+            passed=bool(rows) and canonical_environment_config_present,
+            actual=float(1 if canonical_environment_config_present else 0),
+            expected=1.0,
+            comparator="==",
+        )
     overall_pass = bool(rows and all(item["passed"] for item in criteria.values()))
     ideal_advisory = _build_agentic_ideal_advisory(
         {
@@ -1018,6 +1159,13 @@ def _evaluate_agentic_dataset(contract: dict[str, Any], dataset_root: Path) -> d
             "terminal_dead_count": terminal_dead_count,
             "non_dead_fraction": non_dead_fraction,
             "dead_dominant_action_diversity": dead_dominant_action_diversity,
+            "external_state_fields": external_fields,
+            "missing_external_state_fields": missing_external_fields,
+            "external_state_contact_std": external_std,
+            "min_external_contact_std": None
+            if not math.isfinite(min_external_contact_std)
+            else min_external_contact_std,
+            "environment_config_canonical_present": canonical_environment_config_present,
             "aggregate_recovery_fraction_mean": None if not math.isfinite(recovery_fraction) else recovery_fraction,
             "aggregate_stress_defensive_fraction_mean": None if not math.isfinite(stress_defensive_fraction) else stress_defensive_fraction,
             "aggregate_stress_exploit_fraction_mean": None if not math.isfinite(stress_exploit_fraction) else stress_exploit_fraction,
@@ -1096,6 +1244,12 @@ def _derive_dataset_next_steps(contract: dict[str, Any], eval_report: dict[str, 
         steps.append("Chosen actions are not improving homeostatic error often enough. Increase recovery-oriented shaping before recollecting the agentic dataset.")
     if "stress_defensive_fraction" in failed or "stress_exploit_fraction" in failed:
         steps.append("Under stress the synthetic agent is still too exploit-heavy. Increase toxic or fragile-family pressure and reward defensive responses more strongly.")
+    if (
+        "external_state_fields_present" in failed
+        or "external_state_contact_variability" in failed
+        or "environment_config_canonical_present" in failed
+    ):
+        steps.append("Regenerate agentic data with canonical external-state fields and non-collapsed contact variation before using it for TRM external-world training.")
     if "perturbed_fraction_min" in failed or "perturbed_fraction_max" in failed:
         steps.append("Adjust weak perturbation coverage so the passive dataset includes the intended share of disturbed episodes.")
     if "mean_num_frames" in failed:
@@ -2264,6 +2418,16 @@ def _run_collection_from_contract(contract: dict[str, Any]) -> dict[str, Any]:
                 target_radius=int(cfg["target_radius"]),
                 num_seeds=int(cfg["num_seeds"]),
                 root_seed=int(cfg["root_seed"]),
+                mu_min=float(cfg.get("mu_min", 0.23)),
+                mu_max=float(cfg.get("mu_max", 0.41)),
+                sigma_min=float(cfg.get("sigma_min", 0.033)),
+                sigma_max=float(cfg.get("sigma_max", 0.080)),
+                center_mu_min=float(cfg.get("center_mu_min", 0.27)),
+                center_mu_max=float(cfg.get("center_mu_max", 0.38)),
+                center_sigma_min=float(cfg.get("center_sigma_min", 0.039)),
+                center_sigma_max=float(cfg.get("center_sigma_max", 0.067)),
+                center_sampling_ratio=float(cfg.get("center_sampling_ratio", 0.7)),
+                max_attempts_per_seed=int(cfg.get("max_attempts_per_seed", 12)),
             ),
         )
     else:
@@ -2278,6 +2442,9 @@ def _run_collection_from_contract(contract: dict[str, Any]) -> dict[str, Any]:
         aggregate_recovery_rows: list[tuple[float | None, int]] = []
         aggregate_stress_defensive_rows: list[tuple[float | None, int]] = []
         aggregate_stress_exploit_rows: list[tuple[float | None, int]] = []
+        external_contact_rows: list[tuple[dict[str, Any], int]] = []
+        aggregate_intervention_delta_rows: list[tuple[float | None, int]] = []
+        external_state_fields: list[str] = []
         rejected_total = 0
         attempted_total = 0
         for offset, (policy_mode, num_episodes) in enumerate(mode_mix.items()):
@@ -2294,6 +2461,9 @@ def _run_collection_from_contract(contract: dict[str, Any]) -> dict[str, Any]:
                 env_config=EnvironmentConfig(
                     image_size=int(cfg["image_size"]),
                     target_radius=int(cfg["target_radius"]),
+                    resource_patches=int(cfg.get("resource_patches", 3)),
+                    hazard_patches=int(cfg.get("hazard_patches", 3)),
+                    shelter_patches=int(cfg.get("shelter_patches", 1)),
                 ),
                 num_episodes=int(num_episodes),
                 target_band_weight=float(cfg["target_band_weight"]),
@@ -2323,9 +2493,20 @@ def _run_collection_from_contract(contract: dict[str, Any]) -> dict[str, Any]:
             aggregate_recovery_rows.append((mode_summary.get("aggregate_recovery_fraction_mean"), weight))
             aggregate_stress_defensive_rows.append((mode_summary.get("aggregate_stress_defensive_fraction_mean"), weight))
             aggregate_stress_exploit_rows.append((mode_summary.get("aggregate_stress_exploit_fraction_mean"), weight))
+            mode_external_contact = dict(mode_summary.get("external_state_contact", {}))
+            if mode_external_contact:
+                external_contact_rows.append((mode_external_contact, weight))
+            for field in list(mode_summary.get("external_state_fields", [])):
+                name = str(field)
+                if name not in external_state_fields:
+                    external_state_fields.append(name)
+            aggregate_intervention_delta_rows.append(
+                (mode_summary.get("aggregate_intervention_contact_delta_abs_mean"), weight)
+            )
         merged_rows = sorted(merged_rows, key=lambda row: str(row.get("episode_id", "")))
         manifest_path = dataset_root / "manifest.jsonl"
         save_jsonl(manifest_path, merged_rows)
+        role_view_manifests = write_role_view_manifests(dataset_root, merged_rows)
         save_json(
             dataset_root / "summary.json",
             {
@@ -2342,6 +2523,13 @@ def _run_collection_from_contract(contract: dict[str, Any]) -> dict[str, Any]:
                 "aggregate_recovery_fraction_mean": _weighted_mean(aggregate_recovery_rows),
                 "aggregate_stress_defensive_fraction_mean": _weighted_mean(aggregate_stress_defensive_rows),
                 "aggregate_stress_exploit_fraction_mean": _weighted_mean(aggregate_stress_exploit_rows),
+                "external_state_fields": external_state_fields,
+                "external_state_contact": _merge_external_contact_summaries(external_contact_rows),
+                "aggregate_intervention_contact_delta_abs_mean": _weighted_mean(
+                    aggregate_intervention_delta_rows
+                ),
+                "role_view_manifests": role_view_manifests,
+                "role_view_summary_path": str(dataset_root / "views" / "summary.json"),
                 "rejection_reasons": rejection_reasons,
             },
         )
@@ -2600,13 +2788,24 @@ def main() -> None:
     plan_parser.add_argument("--image-size", type=int, default=64)
     plan_parser.add_argument("--target-radius", type=int, default=12)
     plan_parser.add_argument("--root-seed", type=int, default=20260306)
+    plan_parser.add_argument("--mu-min", type=float, default=0.23)
+    plan_parser.add_argument("--mu-max", type=float, default=0.41)
+    plan_parser.add_argument("--sigma-min", type=float, default=0.033)
+    plan_parser.add_argument("--sigma-max", type=float, default=0.080)
+    plan_parser.add_argument("--center-mu-min", type=float, default=0.27)
+    plan_parser.add_argument("--center-mu-max", type=float, default=0.38)
+    plan_parser.add_argument("--center-sigma-min", type=float, default=0.039)
+    plan_parser.add_argument("--center-sigma-max", type=float, default=0.067)
+    plan_parser.add_argument("--center-sampling-ratio", type=float, default=0.7)
+    plan_parser.add_argument("--max-attempts-per-seed", type=int, default=12)
     plan_parser.add_argument("--episodes", type=int, default=16)
     plan_parser.add_argument("--steps", type=int, default=32)
     plan_parser.add_argument("--runtime-seed", type=int, default=20260318)
     plan_parser.add_argument("--target-band-weight", type=float, default=0.0)
     plan_parser.add_argument("--target-g-overshoot-weight", type=float, default=0.0)
     plan_parser.add_argument("--defensive-family-bias", type=float, default=0.0)
-    plan_parser.add_argument("--policy-mode-mix", nargs="*", default=None)
+    add_environment_config_args(plan_parser)
+    plan_parser.add_argument("--policy-mode-mix", nargs="+", action="append", default=None)
     plan_parser.add_argument("--max-attempt-multiplier", type=int, default=4)
     plan_parser.add_argument("--min-episode-samples", type=int, default=8)
     plan_parser.add_argument("--min-distinct-actions", type=int, default=2)
@@ -2696,12 +2895,25 @@ def main() -> None:
             "image_size": args.image_size,
             "target_radius": args.target_radius,
             "root_seed": args.root_seed,
+            "mu_min": args.mu_min,
+            "mu_max": args.mu_max,
+            "sigma_min": args.sigma_min,
+            "sigma_max": args.sigma_max,
+            "center_mu_min": args.center_mu_min,
+            "center_mu_max": args.center_mu_max,
+            "center_sigma_min": args.center_sigma_min,
+            "center_sigma_max": args.center_sigma_max,
+            "center_sampling_ratio": args.center_sampling_ratio,
+            "max_attempts_per_seed": args.max_attempts_per_seed,
             "episodes": args.episodes,
             "steps": args.steps,
             "runtime_seed": args.runtime_seed,
             "target_band_weight": args.target_band_weight,
             "target_g_overshoot_weight": args.target_g_overshoot_weight,
             "defensive_family_bias": args.defensive_family_bias,
+            "resource_patches": environment_config_from_args(args).resource_patches,
+            "hazard_patches": environment_config_from_args(args).hazard_patches,
+            "shelter_patches": environment_config_from_args(args).shelter_patches,
             "policy_mode_mix": _parse_mode_mix(args.policy_mode_mix),
             "max_attempt_multiplier": args.max_attempt_multiplier,
             "min_episode_samples": args.min_episode_samples,

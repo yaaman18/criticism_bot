@@ -16,6 +16,7 @@ from .erie_runtime import (
     LeniaERIEEnvironment,
     RuntimeConfig,
     RuntimeModels,
+    canonical_environment_config,
     _policy_action_cost,
     _softmax,
 )
@@ -38,6 +39,13 @@ EPISODE_FAMILIES: tuple[str, ...] = (
     "fragile_boundary",
     "vent_edge",
     "uncertain_corridor",
+)
+
+EXTERNAL_CONTACT_FIELDS: tuple[str, ...] = (
+    "energy_gradient",
+    "thermal_stress",
+    "toxicity",
+    "niche_stability",
 )
 
 
@@ -110,6 +118,12 @@ ROLE_VIEW_SPECS: dict[str, dict[str, Any]] = {
         "target_context_key": "mc_target_context_state",
         "target_action_bias_key": "mc_target_action_bias",
         "target_boundary_bias_key": "mc_target_boundary_bias",
+        "intervention_action_key": "executed_action",
+        "intervention_action_onehot_key": "intervention_action_onehot",
+        "intervention_contact_state_key": "intervention_contact_state",
+        "intervention_next_contact_state_key": "intervention_next_contact_state",
+        "intervention_contact_delta_key": "intervention_contact_delta",
+        "intervention_viability_delta_key": "intervention_viability_delta",
         "window_size": 8,
         "input_dim": 44,
         "target_context_dim": 44,
@@ -960,6 +974,12 @@ def _collect_episode_samples_with_shaping(
     as_target_policy: list[np.ndarray] = []
     as_target_action: list[np.ndarray] = []
     executed_action: list[np.ndarray] = []
+    intervention_action_onehot: list[np.ndarray] = []
+    intervention_contact_state: list[np.ndarray] = []
+    intervention_next_contact_state: list[np.ndarray] = []
+    intervention_contact_delta: list[np.ndarray] = []
+    intervention_species_contact_delta: list[np.ndarray] = []
+    intervention_viability_delta: list[np.ndarray] = []
     ag_input_view: list[np.ndarray] = []
     ag_target_gated_logits: list[np.ndarray] = []
     ag_target_inhibition_mask: list[np.ndarray] = []
@@ -1207,6 +1227,41 @@ def _collect_episode_samples_with_shaping(
 
         runtime._apply_action(executed)
         runtime.env.update_fields(runtime.body, executed)
+        next_contact = runtime._contact_stats(runtime.body)
+        next_species_contact = runtime._species_contact_stats(runtime.body)
+        next_env_contact_state = np.array(
+            [
+                next_contact["energy"],
+                next_contact["thermal"],
+                next_contact["toxicity"],
+                next_contact["niche"],
+            ],
+            dtype=np.float32,
+        )
+        next_species_contact_state = np.array(
+            [
+                next_species_contact["species_energy"],
+                next_species_contact["species_thermal"],
+                next_species_contact["species_toxicity"],
+                next_species_contact["species_niche"],
+            ],
+            dtype=np.float32,
+        )
+        intervention_action_onehot.append(_action_onehot(executed, include_no_action=True))
+        intervention_contact_state.append(env_contact_state.astype(np.float32))
+        intervention_next_contact_state.append(next_env_contact_state.astype(np.float32))
+        intervention_contact_delta.append(
+            (next_env_contact_state - env_contact_state).astype(np.float32)
+        )
+        intervention_species_contact_delta.append(
+            (next_species_contact_state - species_contact_state).astype(np.float32)
+        )
+        intervention_viability_delta.append(
+                (
+                    np.array([runtime.body.G, runtime.body.B], dtype=np.float32)
+                    - current_viability_state.astype(np.float32)
+                ).astype(np.float32)
+            )
         prev_observation = observation.astype(np.float32)
         prev_action = executed
         prev_action_cost = action_cost
@@ -1269,6 +1324,12 @@ def _collect_episode_samples_with_shaping(
         "as_target_policy": np.stack(as_target_policy, axis=0).astype(np.float32),
         "as_target_action": np.asarray(as_target_action, dtype=np.int64),
         "executed_action": np.asarray(executed_action, dtype=np.int64),
+        "intervention_action_onehot": np.stack(intervention_action_onehot, axis=0).astype(np.float32),
+        "intervention_contact_state": np.stack(intervention_contact_state, axis=0).astype(np.float32),
+        "intervention_next_contact_state": np.stack(intervention_next_contact_state, axis=0).astype(np.float32),
+        "intervention_contact_delta": np.stack(intervention_contact_delta, axis=0).astype(np.float32),
+        "intervention_species_contact_delta": np.stack(intervention_species_contact_delta, axis=0).astype(np.float32),
+        "intervention_viability_delta": np.stack(intervention_viability_delta, axis=0).astype(np.float32),
         "ag_input_view": np.stack(ag_input_view, axis=0).astype(np.float32),
         "ag_target_gated_logits": np.stack(ag_target_gated_logits, axis=0).astype(np.float32),
         "ag_target_inhibition_mask": np.stack(ag_target_inhibition_mask, axis=0).astype(np.float32),
@@ -1392,6 +1453,32 @@ def _species_context_summary(env: LeniaERIEEnvironment) -> dict[str, Any]:
     }
 
 
+def _external_contact_summary(contact_state: np.ndarray) -> dict[str, Any]:
+    arr = contact_state.astype(np.float32, copy=False)
+    if arr.ndim != 2 or arr.shape[1] < len(EXTERNAL_CONTACT_FIELDS):
+        return {
+            "fields": list(EXTERNAL_CONTACT_FIELDS),
+            "mean": {},
+            "std": {},
+            "min_std": 0.0,
+            "num_samples": 0,
+        }
+    contact = arr[:, : len(EXTERNAL_CONTACT_FIELDS)]
+    means = contact.mean(axis=0)
+    stds = contact.std(axis=0)
+    return {
+        "fields": list(EXTERNAL_CONTACT_FIELDS),
+        "mean": {
+            field: float(means[idx]) for idx, field in enumerate(EXTERNAL_CONTACT_FIELDS)
+        },
+        "std": {
+            field: float(stds[idx]) for idx, field in enumerate(EXTERNAL_CONTACT_FIELDS)
+        },
+        "min_std": float(stds.min()),
+        "num_samples": int(contact.shape[0]),
+    }
+
+
 def _bp_target_mode(action: str) -> int:
     if action in {"intake", "approach"}:
         return 0  # open-like / exploratory
@@ -1400,7 +1487,7 @@ def _bp_target_mode(action: str) -> int:
     return 2  # reconfigure-like
 
 
-def _write_role_view_manifests(
+def write_role_view_manifests(
     output_root: Path,
     manifest_rows: list[dict[str, Any]],
 ) -> dict[str, str]:
@@ -1424,8 +1511,11 @@ def _write_role_view_manifests(
                     "terminal_dead": row["terminal_dead"],
                     "quality": row["quality"],
                     "species_context": row["species_context"],
+                    "external_state_contact": row["external_state_contact"],
+                    "intervention_summary": row["intervention_summary"],
                     "runtime_config": row["runtime_config"],
                     "environment_config": row["environment_config"],
+                    "environment_config_canonical": row["environment_config_canonical"],
                     "view_name": manifest_name,
                     **spec,
                 }
@@ -1439,6 +1529,13 @@ def _write_role_view_manifests(
         }
     save_json(views_root / "summary.json", summary)
     return manifest_paths
+
+
+def _write_role_view_manifests(
+    output_root: Path,
+    manifest_rows: list[dict[str, Any]],
+) -> dict[str, str]:
+    return write_role_view_manifests(output_root, manifest_rows)
 
 
 def prepare_trm_va_cache(
@@ -1475,6 +1572,8 @@ def prepare_trm_va_cache(
     aggregate_recovery_fraction: list[float] = []
     aggregate_stress_defensive_fraction: list[float] = []
     aggregate_stress_exploit_fraction: list[float] = []
+    external_contact_states: list[np.ndarray] = []
+    intervention_contact_delta_abs: list[float] = []
     rejection_reasons: dict[str, int] = {}
     rejected_episodes = 0
     max_attempts = max(int(num_episodes), int(num_episodes) * int(max_attempt_multiplier))
@@ -1510,6 +1609,7 @@ def prepare_trm_va_cache(
             tau_B=episode_runtime_config.tau_B,
         )
         species_context = _species_context_summary(env)
+        external_contact = _external_contact_summary(arrays["vm_contact_state"])
         failures = _episode_quality_failures(
             quality,
             min_episode_samples=min_episode_samples,
@@ -1534,6 +1634,11 @@ def prepare_trm_va_cache(
         aggregate_recovery_fraction.append(float(quality["recovery_fraction"]))
         aggregate_stress_defensive_fraction.append(float(quality["stress_defensive_fraction"]))
         aggregate_stress_exploit_fraction.append(float(quality["stress_exploit_fraction"]))
+        external_contact_states.append(arrays["vm_contact_state"].astype(np.float32, copy=False))
+        intervention_delta_abs_mean = float(
+            np.mean(np.abs(arrays["intervention_contact_delta"].astype(np.float32)))
+        )
+        intervention_contact_delta_abs.append(intervention_delta_abs_mean)
         manifest_rows.append(
             {
                 "episode_id": episode_id,
@@ -1546,8 +1651,18 @@ def prepare_trm_va_cache(
                 "terminal_dead": bool(quality["terminal_dead"]),
                 "quality": quality,
                 "species_context": species_context,
+                "external_state_contact": external_contact,
+                "intervention_summary": {
+                    "action_key": "executed_action",
+                    "contact_state_key": "intervention_contact_state",
+                    "next_contact_state_key": "intervention_next_contact_state",
+                    "contact_delta_key": "intervention_contact_delta",
+                    "viability_delta_key": "intervention_viability_delta",
+                    "contact_delta_abs_mean": intervention_delta_abs_mean,
+                },
                 "runtime_config": asdict(episode_runtime_config),
                 "environment_config": asdict(episode_env_config),
+                "environment_config_canonical": canonical_environment_config(episode_env_config),
                 "target_band_weight": float(target_band_weight),
                 "target_g_overshoot_weight": float(target_g_overshoot_weight),
                 "defensive_family_bias": float(defensive_family_bias),
@@ -1562,7 +1677,12 @@ def prepare_trm_va_cache(
 
     manifest_path = output_root / "manifest.jsonl"
     save_jsonl(manifest_path, manifest_rows)
-    role_view_manifests = _write_role_view_manifests(output_root, manifest_rows)
+    role_view_manifests = write_role_view_manifests(output_root, manifest_rows)
+    external_contact_summary = _external_contact_summary(
+        np.concatenate(external_contact_states, axis=0)
+        if external_contact_states
+        else np.zeros((0, len(EXTERNAL_CONTACT_FIELDS)), dtype=np.float32)
+    )
     save_json(
         output_root / "summary.json",
         {
@@ -1570,6 +1690,7 @@ def prepare_trm_va_cache(
             "num_episodes": int(num_episodes),
             "runtime_config": asdict(runtime_config),
             "environment_config": asdict(env_config),
+            "environment_config_canonical": canonical_environment_config(env_config),
             "episode_families": list(EPISODE_FAMILIES),
             "family_counts": family_counts,
             "family_pool": list(family_pool),
@@ -1596,6 +1717,13 @@ def prepare_trm_va_cache(
             "aggregate_stress_exploit_fraction_mean": float(np.mean(aggregate_stress_exploit_fraction)) if aggregate_stress_exploit_fraction else float("nan"),
             "multispecies_enabled": True,
             "species_roles": ["species_energy", "species_toxic", "species_niche"],
+            "external_state_fields": list(EXTERNAL_CONTACT_FIELDS),
+            "external_state_contact": external_contact_summary,
+            "aggregate_intervention_contact_delta_abs_mean": float(
+                np.mean(intervention_contact_delta_abs)
+            )
+            if intervention_contact_delta_abs
+            else float("nan"),
             "role_view_manifests": role_view_manifests,
             "role_view_summary_path": str(output_root / "views" / "summary.json"),
         },

@@ -59,6 +59,24 @@ def test_prepare_trm_va_cache_writes_vm_and_as_artifacts(tmp_path: Path) -> None
     assert rows[0]["species_context"]["species_roles"] == ["species_energy", "species_toxic", "species_niche"]
     assert "runtime_config" in rows[0]
     assert "environment_config" in rows[0]
+    assert (
+        rows[0]["environment_config_canonical"]["energy_gradient_patches"]
+        == rows[0]["environment_config"]["resource_patches"]
+    )
+    assert (
+        rows[0]["environment_config_canonical"]["thermal_stress_patches"]
+        == rows[0]["environment_config"]["hazard_patches"]
+    )
+    assert (
+        rows[0]["environment_config_canonical"]["niche_stability_patches"]
+        == rows[0]["environment_config"]["shelter_patches"]
+    )
+    assert rows[0]["external_state_contact"]["fields"] == [
+        "energy_gradient",
+        "thermal_stress",
+        "toxicity",
+        "niche_stability",
+    ]
     cache_path = Path(rows[0]["path"])
     assert cache_path.exists()
 
@@ -100,6 +118,13 @@ def test_prepare_trm_va_cache_writes_vm_and_as_artifacts(tmp_path: Path) -> None
         assert data["as_input_view"].shape[1] == 19
         assert data["as_target_policy"].shape[1] == 5
         assert data["as_target_action"].ndim == 1
+        assert data["executed_action"].ndim == 1
+        assert data["intervention_action_onehot"].shape[1] == 6
+        assert data["intervention_contact_state"].shape[1] == 4
+        assert data["intervention_next_contact_state"].shape[1] == 4
+        assert data["intervention_contact_delta"].shape[1] == 4
+        assert data["intervention_species_contact_delta"].shape[1] == 4
+        assert data["intervention_viability_delta"].shape[1] == 2
         assert np.all(data["as_target_policy"] >= 0.0)
         assert data["ag_input_view"].shape[1] == 22
         assert data["ag_target_gated_logits"].shape[1] == 5
@@ -120,6 +145,17 @@ def test_prepare_trm_va_cache_writes_vm_and_as_artifacts(tmp_path: Path) -> None
     assert "aggregate_recovery_fraction_mean" in summary
     assert "aggregate_stress_defensive_fraction_mean" in summary
     assert "aggregate_stress_exploit_fraction_mean" in summary
+    assert summary["environment_config_canonical"]["energy_gradient_patches"] == 3
+    assert summary["environment_config_canonical"]["thermal_stress_patches"] == 3
+    assert summary["environment_config_canonical"]["niche_stability_patches"] == 1
+    assert summary["external_state_fields"] == [
+        "energy_gradient",
+        "thermal_stress",
+        "toxicity",
+        "niche_stability",
+    ]
+    assert summary["external_state_contact"]["num_samples"] >= 2
+    assert "aggregate_intervention_contact_delta_abs_mean" in summary
     assert summary["multispecies_enabled"] is True
     assert summary["species_roles"] == ["species_energy", "species_toxic", "species_niche"]
     assert "role_view_manifests" in summary
@@ -150,6 +186,10 @@ def test_prepare_trm_va_cache_writes_vm_and_as_artifacts(tmp_path: Path) -> None
     assert wp_rows[0]["view_name"] == "trm_wp"
     assert wp_rows[0]["baseline_key"] == "wp_observation"
     assert wp_rows[0]["num_pairs"] == wp_rows[0]["num_samples"]
+    assert (
+        wp_rows[0]["environment_config_canonical"]["energy_gradient_patches"]
+        == wp_rows[0]["environment_config"]["resource_patches"]
+    )
 
     bd_rows = [
         json.loads(line)
@@ -184,6 +224,7 @@ def test_prepare_trm_va_cache_writes_vm_and_as_artifacts(tmp_path: Path) -> None
     assert mc_rows[0]["input_view_key"] == "mc_input_view"
     assert mc_rows[0]["window_mask_key"] == "mc_window_mask"
     assert mc_rows[0]["target_action_bias_key"] == "mc_target_action_bias"
+    assert mc_rows[0]["intervention_contact_delta_key"] == "intervention_contact_delta"
     assert mc_rows[0]["window_size"] == 8
 
 

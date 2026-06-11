@@ -9,9 +9,13 @@ import numpy as np
 import pytest
 
 import trm_pipeline.erie_runtime as erie_runtime_module
+from trm_pipeline.adaptive_controller import AdaptiveControllerConfig
 from trm_pipeline.erie_runtime import (
     ACTIONS,
     BodyState,
+    DEATH_CAUSE_DEGENERATE,
+    DEATH_CAUSE_EXPECTED,
+    DEATH_CAUSE_POLICY_FORBIDDEN,
     ERIERuntime,
     EnvironmentConfig,
     ExternalState,
@@ -275,6 +279,53 @@ def test_update_death_requires_k_irrev_consecutive_steps() -> None:
     for _ in range(runtime.cfg.k_irrev - 1):
         assert runtime._update_death() is False
     assert runtime._update_death() is True
+    assert runtime.last_death_cause == DEATH_CAUSE_EXPECTED
+
+
+def test_update_death_classifies_policy_forbidden_extinction() -> None:
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "k_irrev": 2,
+            "policy_forbidden_min_survival_steps": 8,
+        }
+    )
+    runtime.body.G = runtime.cfg.tau_G - 0.02
+    runtime.body.B = runtime.cfg.tau_B - 0.02
+
+    assert runtime._update_death(t=0, action="intake") is False
+    assert runtime._update_death(t=1, action="intake") is True
+    assert runtime.last_death_cause == DEATH_CAUSE_POLICY_FORBIDDEN
+    assert runtime.last_death_signals["policy_forbidden_window"] is True
+
+
+def test_update_death_classifies_degenerate_action_lock() -> None:
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "policy_mode": "no_action",
+            "k_irrev": 2,
+            "degenerate_action_lock_window": 2,
+            "mu_G": 0.35,
+            "mu_B": 0.35,
+            "tau_G": 0.60,
+            "tau_B": 0.60,
+        }
+    )
+    runtime.body.G = 0.35
+    runtime.body.B = 0.35
+    runtime.env.resource.fill(0.0)
+    runtime.env.hazard.fill(1.0)
+    runtime.env.shelter.fill(0.0)
+
+    dead = runtime.step(0)
+    assert dead is False
+    dead = runtime.step(1)
+    assert dead is True
+    assert runtime.history[-1]["death_cause"] == DEATH_CAUSE_DEGENERATE
+    assert runtime.history[-1]["death_signals"]["action_lock"] is True
 
 
 def test_step_respects_no_action_policy_mode() -> None:
@@ -376,6 +427,12 @@ def test_snapshot_contains_external_state_and_observation(monkeypatch) -> None:
     assert "sensor_gate" in frame
     assert "world_error" in frame
     assert "boundary_error" in frame
+    assert "visual_cell_belief" in frame
+    assert "visual_cell_logvar" in frame
+    assert "visual_cell_projected_belief" in frame
+    assert "visual_attention_map" in frame
+    assert "visual_attention_projected" in frame
+    assert "trace_field" in frame
     assert frame["external_state"].shape == (32, 32, 26)
     assert frame["species_sources"].shape == (32, 32, 3)
     assert frame["species_fields"].shape == (32, 32, 4)
@@ -383,6 +440,12 @@ def test_snapshot_contains_external_state_and_observation(monkeypatch) -> None:
     assert frame["sensor_gate"].shape == (32, 32, 1)
     assert frame["world_error"].shape == (32, 32, 11)
     assert frame["boundary_error"].shape == (32, 32, 2)
+    assert frame["visual_cell_belief"].shape == (8, 8, 11)
+    assert frame["visual_cell_logvar"].shape == (8, 8, 11)
+    assert frame["visual_cell_projected_belief"].shape == (32, 32, 11)
+    assert frame["visual_attention_map"].shape == (8, 8)
+    assert frame["visual_attention_projected"].shape == (32, 32)
+    assert frame["trace_field"].shape == (32, 32)
 
 
 def test_observation_mapping_noise_scale_tracks_stress_and_niche(monkeypatch) -> None:
@@ -485,6 +548,20 @@ def test_ambiguity_proxy_increases_with_logvar() -> None:
     assert high > low
 
 
+def test_visual_attention_targets_high_error_cell() -> None:
+    runtime = _runtime()
+    error = np.zeros_like(runtime.visual_cells.belief, dtype=np.float32)
+    precision = np.ones_like(runtime.visual_cells.belief, dtype=np.float32)
+    error[2, 3, :] = 1.0
+
+    attention = runtime._update_visual_attention(error, precision)
+
+    assert attention["target_row"] == 2
+    assert attention["target_col"] == 3
+    assert float(runtime.visual_attention_map[2, 3]) == pytest.approx(float(runtime.visual_attention_map.max()))
+    assert runtime.visual_attention_projected.shape == runtime.world_belief.shape[:2]
+
+
 def test_policy_scores_prefer_resource_seeking_under_low_hazard() -> None:
     runtime = _runtime()
     runtime.cfg = RuntimeConfig(
@@ -534,11 +611,335 @@ def test_step_history_contains_vfe_and_efe_logs() -> None:
     assert "vfe_world" in row
     assert "vfe_boundary" in row
     assert "vfe_total" in row
+    assert "visual_cell_error_mean" in row
+    assert "visual_cell_belief_mean" in row
+    assert "visual_cell_precision_mean" in row
+    assert "visual_cell_vfe" in row
+    assert "visual_attention_target_row" in row
+    assert "visual_attention_target_col" in row
+    assert "visual_attention_target_y" in row
+    assert "visual_attention_target_x" in row
+    assert "visual_attention_max" in row
+    assert "visual_attention_entropy" in row
     assert "efe_selected" in row
     assert "efe_selected_risk" in row
     assert "efe_selected_ambiguity" in row
     assert "efe_selected_epistemic" in row
+    assert "body_energy" in row
+    assert "body_mass" in row
+    assert "boundary_integrity" in row
+    assert "alive" in row
+    assert "invalid_body_state" in row
+    assert "body_invariant_signals" in row
+    assert "trace_density" in row
+    assert "spawn_drive" in row
+    assert "spawn_drive_no_trace" in row
+    assert "trace_ablation_spawn_delta" in row
+    assert "split_drive" in row
+    assert "spawn_candidate" in row
+    assert "split_candidate" in row
+    assert "p_t" in row
+    assert "body_role" in row
+    assert "challenge_body_count" in row
+    assert "conservative_body_count" in row
+    assert "aux_action_counts" in row
+    assert "aux_policy_source_counts" in row
+    assert "aux_mean_policy_entropy" in row
+    assert "aux_nontrivial_action_count" in row
+    assert row["boundary_interface_observe"] is True
+    assert row["boundary_interface_action"] is True
+    assert 0.0 <= row["spawn_drive"] <= 1.0
+    assert 0.0 <= row["spawn_drive_no_trace"] <= 1.0
+    assert 0.0 <= row["split_drive"] <= 1.0
+    assert row["trace_ablation_spawn_delta"] >= -1e-6
     assert row["vfe_total"] >= row["vfe_world"] + row["vfe_boundary"] - 1e-8
+
+
+def test_auxiliary_policy_action_reflects_role_context() -> None:
+    runtime = _runtime(seed=3900)
+    runtime.cfg = RuntimeConfig(**{**runtime.cfg.__dict__, "aux_policy_mode": "role_heuristic"})
+    body = BodyState(
+        centroid_y=10.0,
+        centroid_x=10.0,
+        radius=4.0,
+        aperture_angle=0.0,
+        aperture_gain=runtime.cfg.aperture_gain,
+        aperture_width_deg=runtime.cfg.aperture_width_deg,
+        G=0.4,
+        B=0.7,
+        body_id=77,
+        role="challenge",
+    )
+    runtime._refresh_body_phenotype(body)
+
+    original_contact_stats = runtime._contact_stats
+
+    def _fake_contact_stats(target_body, *args, **kwargs):
+        if target_body is body and target_body.role == "challenge":
+            return {
+                "energy": 0.2,
+                "thermal": 0.1,
+                "toxicity": 0.1,
+                "niche": 0.2,
+                "resource": 0.2,
+                "hazard": 0.1,
+                "shelter": 0.2,
+                "interface_mass": 1.0,
+            }
+        if target_body is body and target_body.role == "conservative":
+            return {
+                "energy": 0.5,
+                "thermal": 0.7,
+                "toxicity": 0.7,
+                "niche": 0.2,
+                "resource": 0.5,
+                "hazard": 0.7,
+                "shelter": 0.2,
+                "interface_mass": 1.0,
+            }
+        return original_contact_stats(target_body, *args, **kwargs)
+
+    runtime._contact_stats = _fake_contact_stats  # type: ignore[method-assign]
+
+    assert runtime._auxiliary_policy_action(body) == "approach"
+    body.role = "conservative"
+    assert runtime._auxiliary_policy_action(body) == "seal"
+
+
+def test_auxiliary_policy_decision_full_policy_uses_target_body_context() -> None:
+    runtime = _runtime(seed=3905)
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "aux_policy_mode": "full_policy",
+            "policy_mode": "closed_loop",
+        }
+    )
+    aux = BodyState(
+        centroid_y=10.0,
+        centroid_x=12.0,
+        radius=4.0,
+        aperture_angle=0.0,
+        aperture_gain=runtime.cfg.aperture_gain,
+        aperture_width_deg=runtime.cfg.aperture_width_deg,
+        G=0.5,
+        B=0.7,
+        body_id=89,
+        role="challenge",
+    )
+    runtime._refresh_body_phenotype(aux)
+    runtime.bodies.append(aux)
+    original_primary = runtime.body
+    called_body_ids: list[int] = []
+
+    def _fake_policy_scores():
+        called_body_ids.append(int(runtime.body.body_id))
+        scores = np.array([0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float32)
+        diag = {
+            action: {
+                "lookahead_score": float(scores[idx]),
+                "risk": 0.0,
+                "ambiguity": 0.0,
+                "epistemic": 0.0,
+            }
+            for idx, action in enumerate(ACTIONS)
+        }
+        return scores, diag
+
+    def _fake_monitor_viability(action_cost: float = 0.0):
+        return {
+            "source": "analytic",
+            "risk": 0.0,
+            "precision": 1.0,
+            "homeostatic_error": 0.0,
+            "state": np.array([runtime.body.G, runtime.body.B], dtype=np.float32),
+            "action_cost": float(action_cost),
+        }
+
+    def _fake_select_policy(scores, score_diag, viability):
+        return (
+            np.array([0.70, 0.10, 0.10, 0.05, 0.05], dtype=np.float32),
+            "approach",
+            {"source": "analytic"},
+        )
+
+    runtime._policy_scores = _fake_policy_scores  # type: ignore[method-assign]
+    runtime._monitor_viability = _fake_monitor_viability  # type: ignore[method-assign]
+    runtime._select_policy = _fake_select_policy  # type: ignore[method-assign]
+
+    action, meta = runtime._auxiliary_policy_decision(aux)
+
+    assert action == "approach"
+    assert meta["source"] == "full_policy"
+    assert meta["selected_action"] == "approach"
+    assert meta["policy_source"] == "analytic"
+    assert meta["policy_entropy"] >= 0.0
+    assert called_body_ids == [aux.body_id]
+    assert runtime.body is original_primary
+
+
+def test_update_auxiliary_bodies_applies_role_conditioned_actions() -> None:
+    runtime = _runtime(seed=3904)
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "max_bodies": 2,
+            "aux_policy_mode": "role_heuristic",
+        }
+    )
+    aux = BodyState(
+        centroid_y=10.0,
+        centroid_x=10.0,
+        radius=4.0,
+        aperture_angle=0.0,
+        aperture_gain=runtime.cfg.aperture_gain,
+        aperture_width_deg=runtime.cfg.aperture_width_deg,
+        G=0.4,
+        B=0.8,
+        body_id=88,
+        role="challenge",
+    )
+    runtime._refresh_body_phenotype(aux)
+    runtime.bodies.append(aux)
+
+    original_contact_stats = runtime._contact_stats
+
+    def _fake_contact_stats(target_body, *args, **kwargs):
+        if target_body is aux:
+            return {
+                "energy": 0.1,
+                "thermal": 0.05,
+                "toxicity": 0.05,
+                "niche": 0.2,
+                "resource": 0.1,
+                "hazard": 0.05,
+                "shelter": 0.2,
+                "interface_mass": 1.0,
+            }
+        return original_contact_stats(target_body, *args, **kwargs)
+
+    runtime._contact_stats = _fake_contact_stats  # type: ignore[method-assign]
+
+    dead_aux, aux_stats = runtime._update_auxiliary_bodies()
+
+    assert dead_aux == []
+    assert aux_stats["updated_body_count"] == 1
+    assert aux_stats["nontrivial_action_count"] == 1
+    assert aux_stats["action_counts"]["approach"] == 1
+    assert aux_stats["policy_source_counts"]["role_heuristic"] == 1
+    assert 0.0 <= aux_stats["mean_policy_entropy"]
+
+
+def test_activity_ratio_decreases_under_high_hazard() -> None:
+    runtime = _runtime(seed=3901)
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "challenge_ratio_min": 0.0,
+            "challenge_ratio_max": 1.0,
+            "activity_a0": 0.0,
+            "activity_a1": 2.0,
+            "activity_a2": 3.0,
+            "activity_a3": 0.0,
+        }
+    )
+    runtime.body.G = 0.9
+    runtime.body.B = 0.9
+    runtime._refresh_body_phenotype(runtime.body)
+
+    runtime.env.hazard = np.zeros_like(runtime.env.energy_gradient, dtype=np.float32)
+    low = runtime._update_activity_distribution_and_roles()
+    runtime.env.hazard = np.ones_like(runtime.env.energy_gradient, dtype=np.float32)
+    high = runtime._update_activity_distribution_and_roles()
+
+    assert float(high["p_t"]) < float(low["p_t"])
+
+
+def test_assign_roles_prefers_high_score_bodies_for_challenge() -> None:
+    runtime = _runtime(seed=3902)
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "max_bodies": 3,
+            "challenge_ratio_min": 0.0,
+            "challenge_ratio_max": 1.0,
+            "activity_a0": 10.0,
+            "activity_a1": 0.0,
+            "activity_a2": 0.0,
+            "activity_a3": 0.0,
+        }
+    )
+    body_a = BodyState(
+        centroid_y=8.0,
+        centroid_x=8.0,
+        radius=4.0,
+        aperture_angle=0.0,
+        aperture_gain=runtime.cfg.aperture_gain,
+        aperture_width_deg=runtime.cfg.aperture_width_deg,
+        G=0.88,
+        B=0.85,
+        body_id=41,
+        parent_id=0,
+        generation=1,
+    )
+    body_b = BodyState(
+        centroid_y=24.0,
+        centroid_x=24.0,
+        radius=4.0,
+        aperture_angle=0.0,
+        aperture_gain=runtime.cfg.aperture_gain,
+        aperture_width_deg=runtime.cfg.aperture_width_deg,
+        G=0.20,
+        B=0.25,
+        body_id=42,
+        parent_id=0,
+        generation=1,
+    )
+    runtime.bodies.extend([body_a, body_b])
+    runtime.env.hazard.fill(0.0)
+    runtime.env.hazard[20:29, 20:29] = 1.0
+
+    stats = runtime._update_activity_distribution_and_roles()
+    role_map = {body.body_id: body.role for body in runtime.bodies if body.alive}
+
+    assert int(stats["challenge_body_count"]) == 2
+    assert role_map[42] == "conservative"
+    assert role_map[41] == "challenge"
+
+
+def test_role_bias_changes_selected_action_distribution() -> None:
+    runtime = _runtime(seed=3903)
+    runtime.cfg = RuntimeConfig(**{**runtime.cfg.__dict__, "role_action_bias_gain": 1.0})
+    scores = np.zeros((len(ACTIONS),), dtype=np.float32)
+    score_diag = {
+        action: {
+            "risk": 0.0,
+            "ambiguity": 0.0,
+            "epistemic": 0.0,
+            "pred_G": 0.5,
+            "pred_B": 0.5,
+            "death_risk": 0.0,
+            "contact_risk": 0.0,
+            "lookahead_score": 0.0,
+        }
+        for action in ACTIONS
+    }
+    viability = {
+        "state": np.array([0.6, 0.7], dtype=np.float32),
+        "risk": 0.0,
+        "precision": 1.0,
+        "homeostatic_error": 0.0,
+        "homeostatic_error_vector": np.zeros((2,), dtype=np.float32),
+        "source": "analytic",
+    }
+
+    runtime.body.role = "challenge"
+    _, action_challenge, _ = runtime._select_policy(scores, score_diag, viability)
+    runtime.body.role = "conservative"
+    _, action_conservative, _ = runtime._select_policy(scores, score_diag, viability)
+
+    assert action_challenge == "approach"
+    assert action_conservative == "seal"
 
 
 def test_external_channels_include_multispecies_sources() -> None:
@@ -1689,6 +2090,9 @@ def test_closed_loop_step_emits_valid_policy_distribution_and_state_ranges() -> 
     assert row["contact_thermal"] >= 0.0
     assert row["contact_toxicity"] >= 0.0
     assert row["contact_niche"] >= 0.0
+    assert row["contact_resource"] == pytest.approx(row["contact_energy"])
+    assert row["contact_hazard"] == pytest.approx(0.6 * row["contact_thermal"] + 0.4 * row["contact_toxicity"])
+    assert row["contact_shelter"] == pytest.approx(row["contact_niche"])
     assert row["homeostatic_error"] >= 0.0
 
 
@@ -1719,6 +2123,108 @@ def test_runtime_dies_under_sustained_extreme_hazard() -> None:
     assert dead is True
     assert runtime.history[-1]["dead"] is True
     assert runtime.body.dead_count >= runtime.cfg.k_irrev
+
+
+def test_runtime_flags_invalid_body_state_as_degenerate_death() -> None:
+    runtime = _runtime()
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "policy_mode": "no_action",
+            "k_irrev": 1,
+        }
+    )
+    runtime.body.radius = -1.0
+
+    dead = runtime.step(0)
+
+    assert dead is True
+    row = runtime.history[-1]
+    assert row["invalid_body_state"] is True
+    assert row["body_invariant_signals"]["nonpositive_radius"] is True
+    assert row["death_signals"]["invalid_body_state"] is True
+    assert row["death_cause"] == DEATH_CAUSE_DEGENERATE
+
+
+def test_spawn_drive_increases_with_trace_density() -> None:
+    runtime = _runtime()
+    runtime._refresh_body_phenotype(runtime.body)
+
+    runtime.trace_field.fill(0.0)
+    low = runtime._spawn_split_signals(runtime.body)
+
+    runtime.trace_field.fill(1.0)
+    high = runtime._spawn_split_signals(runtime.body)
+
+    assert high["trace_density"] >= low["trace_density"]
+    assert high["spawn_drive"] >= low["spawn_drive"]
+    assert high["trace_ablation_spawn_delta"] >= low["trace_ablation_spawn_delta"]
+
+
+def test_step_executes_spawn_event_when_population_enabled() -> None:
+    runtime = _runtime(seed=3210)
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "max_bodies": 2,
+            "spawn_candidate_threshold": 0.0,
+            "split_candidate_threshold": 2.0,
+            "policy_mode": "no_action",
+        }
+    )
+    runtime.body.G = 0.9
+    runtime.body.B = 0.9
+    runtime._refresh_body_phenotype(runtime.body)
+
+    dead = runtime.step(0)
+
+    assert dead is False
+    assert runtime.history[-1]["spawn_events"] == 1
+    assert runtime.history[-1]["split_events"] == 0
+    assert runtime.history[-1]["body_count"] == 2
+    assert len(runtime.bodies) == 2
+
+
+def test_step_removes_dead_auxiliary_body_and_continues() -> None:
+    runtime = _runtime(seed=3211)
+    runtime.cfg = RuntimeConfig(
+        **{
+            **runtime.cfg.__dict__,
+            "max_bodies": 2,
+            "spawn_candidate_threshold": 2.0,
+            "split_candidate_threshold": 2.0,
+            "policy_mode": "no_action",
+            "k_irrev": 2,
+        }
+    )
+    aux = BodyState(
+        centroid_y=8.0,
+        centroid_x=8.0,
+        radius=4.0,
+        aperture_angle=0.0,
+        aperture_gain=runtime.cfg.aperture_gain,
+        aperture_width_deg=runtime.cfg.aperture_width_deg,
+        G=0.0,
+        B=0.0,
+        dead_count=runtime.cfg.k_irrev - 1,
+        alive=True,
+        body_id=99,
+        parent_id=0,
+        generation=1,
+    )
+    runtime._refresh_body_phenotype(aux)
+    runtime.bodies.append(aux)
+    runtime.env.resource.fill(0.0)
+    runtime.env.hazard.fill(1.0)
+    runtime.env.shelter.fill(0.0)
+
+    dead = runtime.step(0)
+
+    assert dead is False
+    assert runtime.history[-1]["death_events_step"] >= 1
+    assert runtime.history[-1]["body_count"] == 1
+    assert len(runtime.bodies) == 1
+    assert runtime.bodies[0].body_id == runtime.body.body_id
 
 
 def test_closed_loop_outperforms_no_action_in_controlled_resource_corridor() -> None:
@@ -1794,6 +2300,41 @@ def test_run_episode_writes_npz_and_json_logs(tmp_path: Path) -> None:
     assert set(summary["action_counts"]).issuperset(set(ACTIONS))
 
 
+def test_run_episode_with_adaptive_controller_writes_parameter_history(tmp_path: Path) -> None:
+    catalog_path = _seed_catalog(tmp_path)
+    output_root = tmp_path / "out_adaptive"
+    run_cfg = RuntimeConfig(steps=6, warmup_steps=1, seed=5680)
+    env_cfg = EnvironmentConfig(image_size=32, target_radius=8)
+
+    episode_path = run_episode(
+        output_root,
+        catalog_path,
+        run_cfg,
+        env_cfg,
+        adaptive_controller_config=AdaptiveControllerConfig(
+            enabled=True,
+            interval=1,
+            min_steps=1,
+            window_size=2,
+            learning_rate=0.20,
+            target_homeostatic_error=0.0,
+            target_energy_contact=1.0,
+            max_stress_contact=0.0,
+        ),
+    )
+
+    parameter_history_path = episode_path.with_name(f"{episode_path.stem}_parameter_history.json")
+    summary_path = episode_path.with_name(f"{episode_path.stem}_summary.json")
+    events = json.loads(parameter_history_path.read_text(encoding="utf-8"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert parameter_history_path.exists()
+    assert len(events) >= 1
+    assert summary["adaptive_controller"]["enabled"] is True
+    assert summary["adaptive_event_count"] == len(events)
+    assert "final_lenia_params" in summary
+    assert any(name.startswith("lenia.") for event in events for name in event["updates"])
+
+
 def test_run_episode_no_action_mode_records_only_no_action(tmp_path: Path) -> None:
     catalog_path = _seed_catalog(tmp_path)
     output_root = tmp_path / "out_no_action"
@@ -1832,6 +2373,14 @@ def test_run_episode_recorded_arrays_match_summary(tmp_path: Path) -> None:
     assert arrays["species_fields"].shape[0] == expected_frames
     assert arrays["world_belief"].shape[0] == expected_frames
     assert arrays["boundary_belief"].shape[0] == expected_frames
+    assert arrays["visual_cell_belief"].shape[0] == expected_frames
+    assert arrays["visual_cell_belief"].shape[1:] == tuple(summary["visual_cell_shape"])
+    assert arrays["visual_cell_projected_belief"].shape[1:] == arrays["world_belief"].shape[1:]
+    assert arrays["visual_attention_map"].shape[0] == expected_frames
+    assert arrays["visual_attention_map"].shape[1:] == tuple(summary["visual_cell_shape"][:2])
+    assert arrays["visual_attention_projected"].shape[1:] == arrays["world_belief"].shape[1:3]
+    assert "final_visual_attention" in summary
+    assert arrays["trace_field"].shape[0] == expected_frames
 
 
 def test_run_episode_summary_contains_homeostatic_metrics(tmp_path: Path) -> None:
@@ -1862,15 +2411,114 @@ def test_run_episode_summary_contains_homeostatic_metrics(tmp_path: Path) -> Non
     assert "mean_contact_species_thermal" in summary
     assert "mean_contact_species_toxicity" in summary
     assert "mean_contact_species_niche" in summary
+    assert "environment_config_canonical" in summary
+    assert summary["environment_config_canonical"]["energy_gradient_patches"] == summary["environment_config"]["resource_patches"]
+    assert summary["environment_config_canonical"]["thermal_stress_patches"] == summary["environment_config"]["hazard_patches"]
+    assert summary["environment_config_canonical"]["niche_stability_patches"] == summary["environment_config"]["shelter_patches"]
     assert summary["multispecies_enabled"] is True
     assert summary["species_roles"] == ["species_energy", "species_toxic", "species_niche"]
     assert "action_diversity" in summary
+    assert "invalid_body_state_count" in summary
+    assert "boundary_interface_usage_rate" in summary
+    assert "mean_trace_mass" in summary
+    assert "final_trace_mass" in summary
+    assert "mean_trace_density" in summary
+    assert "mean_spawn_drive" in summary
+    assert "mean_spawn_drive_no_trace" in summary
+    assert "mean_trace_ablation_spawn_delta" in summary
+    assert "spawn_candidate_rate" in summary
+    assert "mean_split_drive" in summary
+    assert "split_candidate_rate" in summary
+    assert "mean_body_count" in summary
+    assert "max_body_count" in summary
+    assert "spawn_events_total" in summary
+    assert "split_events_total" in summary
+    assert "death_events_total" in summary
+    assert "mean_p_t" in summary
+    assert "mean_challenge_fraction" in summary
+    assert "role_switch_events_total" in summary
+    assert "mean_aux_updated_body_count" in summary
+    assert "mean_aux_policy_entropy" in summary
+    assert "aux_full_policy_rate" in summary
+    assert "aux_role_heuristic_rate" in summary
+    assert "aux_passive_rate" in summary
+    assert "mean_aux_nontrivial_action_count" in summary
+    assert "mean_aux_challenge_action_count" in summary
+    assert "mean_aux_conservative_action_count" in summary
     assert 0.0 <= summary["survival_fraction"] <= 1.0
     assert 0.0 <= summary["mean_G"] <= 1.0
     assert 0.0 <= summary["mean_B"] <= 1.0
     assert summary["action_cost_total"] == 0.0
     assert 0.0 <= summary["mean_policy_entropy"]
     assert 0.0 <= summary["action_diversity"] <= 1.0
+    assert summary["invalid_body_state_count"] >= 0.0
+    assert 0.0 <= summary["boundary_interface_usage_rate"] <= 1.0
+    assert summary["boundary_interface_usage_rate"] == pytest.approx(1.0)
+    assert summary["mean_trace_mass"] >= 0.0
+    assert summary["final_trace_mass"] >= 0.0
+    assert 0.0 <= summary["mean_spawn_drive"] <= 1.0
+    assert 0.0 <= summary["mean_spawn_drive_no_trace"] <= 1.0
+    assert summary["mean_trace_ablation_spawn_delta"] >= -1e-6
+    assert 0.0 <= summary["spawn_candidate_rate"] <= 1.0
+    assert 0.0 <= summary["mean_split_drive"] <= 1.0
+    assert 0.0 <= summary["split_candidate_rate"] <= 1.0
+    assert summary["mean_body_count"] >= 1.0
+    assert summary["max_body_count"] >= 1.0
+    assert summary["spawn_events_total"] >= 0.0
+    assert summary["split_events_total"] >= 0.0
+    assert summary["death_events_total"] >= 0.0
+    assert 0.0 <= summary["mean_p_t"] <= 1.0
+    assert 0.0 <= summary["mean_challenge_fraction"] <= 1.0
+    assert summary["role_switch_events_total"] >= 0.0
+    assert summary["mean_aux_updated_body_count"] >= 0.0
+    assert summary["mean_aux_policy_entropy"] >= 0.0
+    assert 0.0 <= summary["aux_full_policy_rate"] <= 1.0
+    assert 0.0 <= summary["aux_role_heuristic_rate"] <= 1.0
+    assert 0.0 <= summary["aux_passive_rate"] <= 1.0
+    assert summary["aux_full_policy_rate"] + summary["aux_role_heuristic_rate"] + summary["aux_passive_rate"] <= 1.0 + 1e-6
+    assert summary["mean_aux_nontrivial_action_count"] >= 0.0
+    assert summary["mean_aux_challenge_action_count"] >= 0.0
+    assert summary["mean_aux_conservative_action_count"] >= 0.0
+
+
+def test_run_episode_summary_contains_death_cause_metrics(tmp_path: Path) -> None:
+    catalog_path = _seed_catalog(tmp_path)
+    output_root = tmp_path / "out_death_metrics"
+    run_cfg = RuntimeConfig(
+        steps=8,
+        warmup_steps=1,
+        seed=8201,
+        policy_mode="no_action",
+        k_irrev=2,
+        mu_G=0.30,
+        mu_B=0.30,
+        tau_G=0.60,
+        tau_B=0.60,
+    )
+    env_cfg = EnvironmentConfig(image_size=32, target_radius=8)
+
+    episode_path = run_episode(output_root, catalog_path, run_cfg, env_cfg)
+    summary_path = episode_path.with_name(f"{episode_path.stem}_summary.json")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    assert "death_cause_counts" in summary
+    assert set(summary["death_cause_counts"]) == {
+        DEATH_CAUSE_EXPECTED,
+        DEATH_CAUSE_DEGENERATE,
+        DEATH_CAUSE_POLICY_FORBIDDEN,
+    }
+    assert "final_death_cause" in summary
+    assert "final_alive" in summary
+    assert "final_body_count" in summary
+    assert "final_challenge_ratio" in summary
+    assert "boundary_interface_counts" in summary
+    assert "population_event_counts" in summary
+    assert "death_events" in summary
+    assert "expected_death_events" in summary
+    assert "degenerate_death_events" in summary
+    assert "policy_forbidden_death_events" in summary
+    if summary["dead"]:
+        assert summary["final_death_cause"] in summary["death_cause_counts"]
 
 
 def test_main_propagates_runtime_and_environment_cli_knobs(tmp_path: Path, monkeypatch) -> None:
@@ -1885,6 +2533,7 @@ def test_main_propagates_runtime_and_environment_cli_knobs(tmp_path: Path, monke
         trm_b_checkpoint=None,
         module_specs=None,
         module_manifest=None,
+        adaptive_controller_config=None,
     ) -> Path:
         captured["output_root"] = Path(output_root)
         captured["seed_catalog"] = Path(seed_catalog)
@@ -1894,6 +2543,7 @@ def test_main_propagates_runtime_and_environment_cli_knobs(tmp_path: Path, monke
         captured["trm_b_checkpoint"] = trm_b_checkpoint
         captured["module_specs"] = module_specs
         captured["module_manifest"] = module_manifest
+        captured["adaptive_controller_config"] = adaptive_controller_config
         return Path(output_root) / "fake_episode.npz"
 
     monkeypatch.setattr(erie_runtime_module, "run_episode", fake_run_episode)
@@ -1950,3 +2600,53 @@ def test_main_propagates_runtime_and_environment_cli_knobs(tmp_path: Path, monke
     assert env_config.shelter_patches == 2
     assert captured["module_specs"] is None
     assert captured["module_manifest"] is None
+    assert captured["adaptive_controller_config"].enabled is False
+
+
+def test_main_accepts_canonical_environment_cli_knobs(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_episode(
+        output_root: str | Path,
+        seed_catalog: str | Path,
+        runtime_config: RuntimeConfig,
+        env_config: EnvironmentConfig,
+        trm_a_checkpoint=None,
+        trm_b_checkpoint=None,
+        module_specs=None,
+        module_manifest=None,
+        adaptive_controller_config=None,
+    ) -> Path:
+        captured["env_config"] = env_config
+        captured["adaptive_controller_config"] = adaptive_controller_config
+        return Path(output_root) / "fake_episode.npz"
+
+    monkeypatch.setattr(erie_runtime_module, "run_episode", fake_run_episode)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "erie_runtime",
+            "--output-root",
+            str(tmp_path / "runtime"),
+            "--seed-catalog",
+            str(tmp_path / "catalog.json"),
+            "--energy-gradient-patches",
+            "6",
+            "--thermal-stress-patches",
+            "4",
+            "--niche-stability-patches",
+            "3",
+        ],
+    )
+
+    erie_runtime_module.main()
+
+    env_config = captured["env_config"]
+    assert isinstance(env_config, EnvironmentConfig)
+    assert env_config.resource_patches == 6
+    assert env_config.hazard_patches == 4
+    assert env_config.shelter_patches == 3
+    assert env_config.energy_gradient_patches == 6
+    assert env_config.thermal_stress_patches == 4
+    assert env_config.niche_stability_patches == 3

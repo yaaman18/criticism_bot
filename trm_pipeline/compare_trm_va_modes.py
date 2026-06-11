@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from .common import ensure_dir, load_json, save_json
-from .erie_runtime import EnvironmentConfig, RuntimeConfig, run_episode
+from .erie_runtime import RuntimeConfig, add_environment_config_args, environment_config_from_args, run_episode
 
 MODE_VALUES = ("analytic", "assistive", "module_primary")
 
@@ -52,9 +52,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260321)
     parser.add_argument("--lookahead-horizon", type=int, default=2)
     parser.add_argument("--lookahead-discount", type=float, default=0.85)
-    parser.add_argument("--resource-patches", type=int, default=3)
-    parser.add_argument("--hazard-patches", type=int, default=3)
-    parser.add_argument("--shelter-patches", type=int, default=1)
+    add_environment_config_args(parser)
     parser.add_argument("--trm-a-checkpoint", default=None)
     parser.add_argument("--trm-b-checkpoint", default=None)
     parser.add_argument("--module-manifest", default=None)
@@ -66,11 +64,7 @@ def main() -> None:
     args = parser.parse_args()
 
     output_root = ensure_dir(args.output_root)
-    env_config = EnvironmentConfig(
-        resource_patches=args.resource_patches,
-        hazard_patches=args.hazard_patches,
-        shelter_patches=args.shelter_patches,
-    )
+    env_config = environment_config_from_args(args)
     results: dict[str, dict] = {}
     for viability_mode in MODE_VALUES:
         for action_mode in MODE_VALUES:

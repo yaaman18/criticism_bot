@@ -2,7 +2,7 @@ VENV_BIN := $(abspath ./.venv/bin)
 export PATH := $(VENV_BIN):$(PATH)
 PYTHON ?= $(VENV_BIN)/python
 
-.PHONY: bootstrap doctor test test-cov run ui harness-smoke dataset-smoke production-campaign production-finalize
+.PHONY: bootstrap doctor test test-cov run ui harness-smoke dataset-smoke production-campaign production-finalize promotion-check
 
 bootstrap:
 	./scripts/bootstrap_env.sh
@@ -33,3 +33,6 @@ production-campaign:
 
 production-finalize:
 	./scripts/finalize_production_campaign.sh
+
+promotion-check:
+	$(PYTHON) ./scripts/check_promotion_decision.py --decision $(DECISION)

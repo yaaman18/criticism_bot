@@ -40,6 +40,14 @@ from anthropic_art_critic_chat import (
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = str(BASE_DIR / "chat_memory.sqlite3")
 SUPPORTED_IMAGE_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+CUSTOM_MODEL_OPTION = "__custom__"
+MODEL_PRESETS = [
+    ("Claude Opus 4.7", "claude-opus-4-7"),
+    ("Claude Sonnet 4.6", "claude-sonnet-4-6"),
+    ("Claude Haiku 4.5", "claude-haiku-4-5"),
+]
+MODEL_PRESET_IDS = [model_id for _, model_id in MODEL_PRESETS]
+MODEL_PRESET_LABELS = {model_id: label for label, model_id in MODEL_PRESETS}
 MAX_TEXT_FILES_PER_TURN = 5
 MAX_TEXT_FILE_BYTES = 350_000
 MAX_TEXT_FILE_CHARS = 12_000
@@ -90,25 +98,14 @@ def trim_runtime_messages(
 
 
 def apply_styles(theme_mode: str) -> None:
-    if theme_mode == "Light":
-        theme_vars = """
-        :root {
-          --bg: #f6f7f8;
-          --panel: #ffffff;
-          --card: #ffffff;
-          --ink: #111827;
-          --muted: #4b5563;
-          --line: #d1d5db;
-          --accent: #2563eb;
-        }
-        """
-    else:
-        theme_vars = """
+    _ = theme_mode
+    theme_vars = """
         :root {
           --bg: #07090d;
           --panel: #0d1118;
+          --panel-2: #111827;
           --card: #111827;
-          --ink: #ffffff;
+          --ink: #f8fafc;
           --muted: #c7ced9;
           --line: #273244;
           --accent: #6ea8ff;
@@ -125,6 +122,9 @@ def apply_styles(theme_mode: str) -> None:
         [data-testid="stToolbar"],
         [data-testid="stSidebar"],
         [data-testid="stSidebar"] > div:first-child,
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"],
+        [data-testid="stPopoverBody"],
         .stApp {
           background: var(--bg) !important;
         }
@@ -160,17 +160,61 @@ def apply_styles(theme_mode: str) -> None:
         }
         [data-testid="stChatInput"],
         [data-testid="stChatInput"] > div,
+        [data-testid="stChatInputContainer"],
+        [data-testid="stChatFloatingInputContainer"],
+        [data-testid="stBottomBlockContainer"],
+        [data-testid="stBottomBlockContainer"] > div,
         [data-testid="stChatInput"] textarea,
         [data-testid="stChatInput"] input,
+        [data-testid="stFileUploaderDropzone"],
+        [data-testid="stFileUploaderDropzone"] > div,
+        [data-testid="stFileUploaderDropzone"] button,
+        .stTextInput > div,
+        .stTextInput > div > div,
+        .stTextArea > div,
+        .stTextArea > div > div,
+        .stNumberInput > div,
+        .stNumberInput > div > div,
+        [data-baseweb="input"],
+        [data-baseweb="input"] > div,
+        [data-baseweb="textarea"],
+        [data-baseweb="textarea"] > div,
         .stTextInput input,
         .stTextArea textarea,
         .stNumberInput input,
         .stSelectbox [data-baseweb="select"] > div,
+        [data-baseweb="popover"],
+        [data-baseweb="popover"] > div,
+        [data-baseweb="menu"],
+        [role="listbox"],
+        [role="option"],
         .stFileUploader section,
         .stFileUploader > div {
           background: var(--panel) !important;
           color: var(--ink) !important;
           border-color: var(--line) !important;
+        }
+        [data-testid="stChatInput"] button,
+        [data-testid="stChatInputSubmitButton"],
+        [data-testid="stChatInputSubmitButton"] button,
+        .stNumberInput button,
+        [data-testid="stNumberInput"] button,
+        button[aria-label="Increment"],
+        button[aria-label="Decrement"],
+        button[title="Increment"],
+        button[title="Decrement"] {
+          background: var(--panel-2) !important;
+          color: var(--ink) !important;
+          border-color: var(--line) !important;
+          box-shadow: none !important;
+        }
+        .stNumberInput button svg,
+        [data-testid="stNumberInput"] button svg,
+        [data-testid="stChatInput"] button svg,
+        [data-testid="stChatInputSubmitButton"] svg {
+          color: var(--ink) !important;
+          fill: currentColor !important;
+          stroke: currentColor !important;
         }
         input::placeholder, textarea::placeholder {
           color: var(--muted) !important;
@@ -190,6 +234,14 @@ def apply_styles(theme_mode: str) -> None:
           background: var(--panel) !important;
           color: var(--ink) !important;
           border: 1px solid var(--line) !important;
+        }
+        [data-testid="stAlert"],
+        [data-testid="stExpander"],
+        [data-testid="stExpander"] details,
+        [data-testid="stExpander"] summary {
+          background: var(--panel-2) !important;
+          color: var(--ink) !important;
+          border-color: var(--line) !important;
         }
         hr {
           border-color: var(--line) !important;
@@ -650,8 +702,14 @@ def generate_assistant_reply(
 
 def init_state() -> None:
     if st.session_state.get("ui_initialized"):
-        if "theme_mode" not in st.session_state:
-            st.session_state.theme_mode = "Dark"
+        st.session_state.theme_mode = "Dark"
+        if "model" not in st.session_state or not str(st.session_state.model).strip():
+            st.session_state.model = DEFAULT_MODEL
+        if "model_preset" not in st.session_state:
+            current_model = str(st.session_state.model or "").strip()
+            st.session_state.model_preset = (
+                current_model if current_model in MODEL_PRESET_IDS else CUSTOM_MODEL_OPTION
+            )
         return
 
     load_dotenv(override=False)
@@ -671,6 +729,9 @@ def init_state() -> None:
     st.session_state.ui_initialized = True
     st.session_state.db_path = db_path
     st.session_state.model = DEFAULT_MODEL
+    st.session_state.model_preset = (
+        DEFAULT_MODEL if DEFAULT_MODEL in MODEL_PRESET_IDS else CUSTOM_MODEL_OPTION
+    )
     st.session_state.max_tokens = DEFAULT_MAX_TOKENS
     st.session_state.max_input_tokens = DEFAULT_MAX_INPUT_TOKENS
     st.session_state.max_history_turns = DEFAULT_MAX_HISTORY_TURNS
@@ -692,6 +753,7 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
     init_state()
+    st.session_state.theme_mode = "Dark"
     apply_styles(st.session_state.theme_mode)
 
     st.title("Criticism Bot UI")
@@ -711,7 +773,7 @@ def main() -> None:
 
     with st.sidebar:
         st.subheader("Session")
-        st.selectbox("Theme", options=["Dark", "Light"], key="theme_mode")
+        st.caption("Theme: Dark")
         st.text_input("Database Path", key="db_path")
         st.caption(f"Resolved DB: {Path(st.session_state.db_path).expanduser().resolve()}")
 
@@ -821,7 +883,28 @@ def main() -> None:
 
         st.divider()
         st.subheader("Model")
-        st.text_input("Model", key="model")
+        current_model = str(st.session_state.model or "").strip()
+        model_preset_options = MODEL_PRESET_IDS + [CUSTOM_MODEL_OPTION]
+        if st.session_state.get("model_preset") not in model_preset_options:
+            st.session_state.model_preset = (
+                current_model if current_model in MODEL_PRESET_IDS else CUSTOM_MODEL_OPTION
+            )
+
+        selected_model_preset = st.selectbox(
+            "Model Preset",
+            options=model_preset_options,
+            key="model_preset",
+            format_func=lambda model_id: (
+                f"{MODEL_PRESET_LABELS[model_id]} ({model_id})"
+                if model_id != CUSTOM_MODEL_OPTION
+                else "Custom model ID"
+            ),
+        )
+        if selected_model_preset == CUSTOM_MODEL_OPTION:
+            st.text_input("Custom Model", key="model")
+        else:
+            st.session_state.model = selected_model_preset
+            st.caption(f"API model: `{selected_model_preset}`")
         st.number_input("Max Tokens", min_value=256, max_value=8192, step=128, key="max_tokens")
         st.number_input(
             "Max Input Tokens",

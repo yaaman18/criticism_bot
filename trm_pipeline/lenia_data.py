@@ -17,7 +17,7 @@ from .common import (
     gaussian_noise,
     load_json,
     normalize_minmax,
-    reject_scalar_episode,
+    reject_scalar_episode_reason,
     robust_percentile_range,
     save_json,
     save_jsonl,
@@ -162,11 +162,20 @@ def load_seed_catalog(path: str | Path) -> list[LeniaSeed]:
 def sample_params(
     rng: np.random.Generator, config: RolloutConfig, seed_params: dict[str, Any]
 ) -> dict[str, Any]:
+    params, _ = _sample_params_with_mode(rng, config, seed_params)
+    return params
+
+
+def _sample_params_with_mode(
+    rng: np.random.Generator, config: RolloutConfig, seed_params: dict[str, Any]
+) -> tuple[dict[str, Any], str]:
     center_sample = rng.random() < config.center_sampling_ratio
     if center_sample:
+        sampling_mode = "center"
         m = float(rng.uniform(config.center_mu_min, config.center_mu_max))
         s = float(rng.uniform(config.center_sigma_min, config.center_sigma_max))
     else:
+        sampling_mode = "wide"
         m = float(rng.uniform(config.mu_min, config.mu_max))
         s = float(rng.uniform(config.sigma_min, config.sigma_max))
     params = {
@@ -179,7 +188,7 @@ def sample_params(
         "gn": int(seed_params.get("gn", 1)),
         "source_R": int(seed_params.get("R", config.target_radius)),
     }
-    return params
+    return params, sampling_mode
 
 
 def build_kernel(size: int, radius: int, bands: list[float]) -> np.ndarray:
@@ -263,14 +272,80 @@ def derive_multichannel_state(
     return state.astype(np.float32)
 
 
-def sample_episode(
+def lenia_parameter_search_config(config: RolloutConfig) -> dict[str, Any]:
+    return {
+        "curator_version": "lenia_parameter_search_v1",
+        "target_radius": int(config.target_radius),
+        "max_attempts_per_seed": int(config.max_attempts_per_seed),
+        "sampling_modes": {
+            "center": {
+                "ratio": float(config.center_sampling_ratio),
+                "mu_range": [float(config.center_mu_min), float(config.center_mu_max)],
+                "sigma_range": [
+                    float(config.center_sigma_min),
+                    float(config.center_sigma_max),
+                ],
+            },
+            "wide": {
+                "ratio": float(max(0.0, 1.0 - config.center_sampling_ratio)),
+                "mu_range": [float(config.mu_min), float(config.mu_max)],
+                "sigma_range": [float(config.sigma_min), float(config.sigma_max)],
+            },
+        },
+        "rejection_criteria": {
+            "empty_mass": "final mass < 1e-2",
+            "low_mean": "final mean < 5e-4",
+            "saturated_mean": "final mean > 0.95",
+            "static_std": "final std < 1e-4",
+        },
+    }
+
+
+def _serializable_lenia_params(
+    params: dict[str, Any], config: RolloutConfig
+) -> dict[str, Any]:
+    return {
+        "R": int(config.target_radius),
+        "T": int(params["T"]),
+        "b": [float(v) for v in params["b"]],
+        "m": float(params["m"]),
+        "s": float(params["s"]),
+        "kn": int(params["kn"]),
+        "gn": int(params["gn"]),
+        "source_R": int(params["source_R"]),
+    }
+
+
+def _empty_search_report(config: RolloutConfig) -> dict[str, Any]:
+    return {
+        "curator_version": "lenia_parameter_search_v1",
+        "attempted_parameter_sets": 0,
+        "rejected_parameter_sets": 0,
+        "rejection_reasons": {},
+        "sampling_mode_counts": {"center": 0, "wide": 0},
+        "accepted_sampling_mode": None,
+        "accepted_attempt": None,
+        "max_attempts_per_seed": int(config.max_attempts_per_seed),
+    }
+
+
+def sample_episode_with_report(
     seed: LeniaSeed,
     config: RolloutConfig,
     rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray, dict[str, Any], dict[str, Any]] | None:
+) -> tuple[
+    tuple[np.ndarray, np.ndarray, dict[str, Any], dict[str, Any]] | None,
+    dict[str, Any],
+]:
     scalar_seed = center_seed_on_canvas(rle2arr_2d(seed.cells_rle), config.image_size)
-    for _ in range(config.max_attempts_per_seed):
-        params = sample_params(rng, config, seed.params)
+    search_report = _empty_search_report(config)
+    for attempt_idx in range(1, config.max_attempts_per_seed + 1):
+        params, sampling_mode = _sample_params_with_mode(rng, config, seed.params)
+        search_report["attempted_parameter_sets"] = int(
+            search_report["attempted_parameter_sets"] + 1
+        )
+        sampling_mode_counts = search_report["sampling_mode_counts"]
+        sampling_mode_counts[sampling_mode] = int(sampling_mode_counts.get(sampling_mode, 0) + 1)
         kernel = build_kernel(config.image_size, config.target_radius, params["b"])
         kernel_fft = np.fft.fft2(kernel)
         perturb_low = config.warmup_steps + 4
@@ -301,32 +376,49 @@ def sample_episode(
         scalar_array = np.stack(scalar_frames, axis=0)
         multi_array = np.stack(multi_frames, axis=0)
         summary = activity_summary(scalar_array[-1])
-        if reject_scalar_episode(summary):
+        reject_reason = reject_scalar_episode_reason(summary)
+        if reject_reason is not None:
+            search_report["rejected_parameter_sets"] = int(
+                search_report["rejected_parameter_sets"] + 1
+            )
+            rejection_reasons = search_report["rejection_reasons"]
+            rejection_reasons[reject_reason] = int(rejection_reasons.get(reject_reason, 0) + 1)
             continue
         regime, regime_stats = classify_regime_from_scalar_states(scalar_array)
+        lenia_params = _serializable_lenia_params(params, config)
+        search_report["accepted_sampling_mode"] = sampling_mode
+        search_report["accepted_attempt"] = int(attempt_idx)
         meta = {
             "seed_id": seed.seed_id,
             "source_file": seed.source_file,
             "source_code": seed.code,
             "source_name": seed.name,
-            "lenia_params": {
-                "R": config.target_radius,
-                "T": params["T"],
-                "b": [float(v) for v in params["b"]],
-                "m": float(params["m"]),
-                "s": float(params["s"]),
-                "kn": params["kn"],
-                "gn": params["gn"],
-                "source_R": params["source_R"],
-            },
+            "lenia_params": lenia_params,
             "perturb_mode": perturb_mode,
             "perturb_step": perturb_step,
             "summary": summary,
             "regime": regime,
             "regime_stats": regime_stats,
+            "parameter_search": {
+                "curator_version": search_report["curator_version"],
+                "sampling_mode": sampling_mode,
+                "attempt_count": int(search_report["attempted_parameter_sets"]),
+                "rejected_attempts": int(search_report["rejected_parameter_sets"]),
+                "rejection_reasons": dict(search_report["rejection_reasons"]),
+                "max_attempts_per_seed": int(config.max_attempts_per_seed),
+            },
         }
-        return scalar_array, multi_array, params, meta
-    return None
+        return (scalar_array, multi_array, params, meta), search_report
+    return None, search_report
+
+
+def sample_episode(
+    seed: LeniaSeed,
+    config: RolloutConfig,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], dict[str, Any]] | None:
+    episode, _ = sample_episode_with_report(seed, config, rng)
+    return episode
 
 
 def generate_rollouts(
@@ -345,11 +437,21 @@ def generate_rollouts(
     regime_counts: dict[str, int] = {}
     split_counts: dict[str, int] = {}
     perturb_counts = {"none": 0, "local": 0, "global": 0}
+    sampling_mode_counts = {"center": 0, "wide": 0}
+    rejection_reasons: dict[str, int] = {}
+    attempted_parameter_sets = 0
+    rejected_parameter_sets = 0
     mu_values: list[float] = []
     sigma_values: list[float] = []
     for order_idx, seed_idx in enumerate(selected_indices.tolist()):
         seed = seeds[seed_idx]
-        episode = sample_episode(seed, config, rng)
+        episode, search_report = sample_episode_with_report(seed, config, rng)
+        attempted_parameter_sets += int(search_report["attempted_parameter_sets"])
+        rejected_parameter_sets += int(search_report["rejected_parameter_sets"])
+        for mode, count in search_report["sampling_mode_counts"].items():
+            sampling_mode_counts[mode] = int(sampling_mode_counts.get(mode, 0) + int(count))
+        for reason, count in search_report["rejection_reasons"].items():
+            rejection_reasons[reason] = int(rejection_reasons.get(reason, 0) + int(count))
         if episode is None:
             continue
         scalar_frames, multi_frames, params, meta = episode
@@ -378,6 +480,7 @@ def generate_rollouts(
                 "summary": meta["summary"],
                 "regime": meta["regime"],
                 "regime_stats": meta["regime_stats"],
+                "parameter_search": meta["parameter_search"],
             }
         )
         regime = str(meta["regime"])
@@ -402,6 +505,11 @@ def generate_rollouts(
             "regime_counts": regime_counts,
             "split_counts": split_counts,
             "perturb_counts": perturb_counts,
+            "parameter_search": lenia_parameter_search_config(config),
+            "attempted_parameter_sets": int(attempted_parameter_sets),
+            "rejected_parameter_sets": int(rejected_parameter_sets),
+            "rejection_reasons": rejection_reasons,
+            "sampling_mode_counts": sampling_mode_counts,
             "mu_range": [float(min(mu_values)), float(max(mu_values))] if mu_values else None,
             "sigma_range": [float(min(sigma_values)), float(max(sigma_values))] if sigma_values else None,
         },
@@ -427,6 +535,16 @@ def main() -> None:
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--target-radius", type=int, default=12)
     parser.add_argument("--seed", type=int, default=20260306)
+    parser.add_argument("--mu-min", type=float, default=0.23)
+    parser.add_argument("--mu-max", type=float, default=0.41)
+    parser.add_argument("--sigma-min", type=float, default=0.033)
+    parser.add_argument("--sigma-max", type=float, default=0.080)
+    parser.add_argument("--center-mu-min", type=float, default=0.27)
+    parser.add_argument("--center-mu-max", type=float, default=0.38)
+    parser.add_argument("--center-sigma-min", type=float, default=0.039)
+    parser.add_argument("--center-sigma-max", type=float, default=0.067)
+    parser.add_argument("--center-sampling-ratio", type=float, default=0.7)
+    parser.add_argument("--max-attempts-per-seed", type=int, default=12)
     args = parser.parse_args()
     seed_everything(args.seed)
     config = RolloutConfig(
@@ -436,6 +554,16 @@ def main() -> None:
         target_radius=args.target_radius,
         num_seeds=args.num_seeds,
         root_seed=args.seed,
+        mu_min=args.mu_min,
+        mu_max=args.mu_max,
+        sigma_min=args.sigma_min,
+        sigma_max=args.sigma_max,
+        center_mu_min=args.center_mu_min,
+        center_mu_max=args.center_mu_max,
+        center_sigma_min=args.center_sigma_min,
+        center_sigma_max=args.center_sigma_max,
+        center_sampling_ratio=args.center_sampling_ratio,
+        max_attempts_per_seed=args.max_attempts_per_seed,
     )
     manifest_path = generate_rollouts(args.output_root, args.seed_catalog, config)
     print(f"wrote manifest: {manifest_path}")

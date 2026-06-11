@@ -5,6 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
+import trm_pipeline.lenia_data as lenia_data
+from trm_pipeline.common import reject_scalar_episode_reason
 from trm_pipeline.lenia_data import (
     RolloutConfig,
     build_kernel,
@@ -80,6 +82,20 @@ def test_sample_params_stays_within_config_ranges() -> None:
     assert params["T"] == 8
 
 
+def test_reject_scalar_episode_reason_names_curator_failures() -> None:
+    assert reject_scalar_episode_reason({"mass": 0.0, "mean": 0.0, "std": 0.0}) == "empty_mass"
+    assert reject_scalar_episode_reason({"mass": 1.0, "mean": 1e-5, "std": 0.1}) == "low_mean"
+    assert (
+        reject_scalar_episode_reason({"mass": 100.0, "mean": 0.99, "std": 0.1})
+        == "saturated_mean"
+    )
+    assert (
+        reject_scalar_episode_reason({"mass": 1.0, "mean": 0.1, "std": 1e-5})
+        == "static_std"
+    )
+    assert reject_scalar_episode_reason({"mass": 1.0, "mean": 0.1, "std": 0.1}) is None
+
+
 def test_build_kernel_is_normalized() -> None:
     kernel = build_kernel(32, 8, [1.0, 0.5])
     assert kernel.shape == (32, 32)
@@ -124,6 +140,9 @@ def test_sample_episode_returns_scalar_multi_and_meta() -> None:
     assert params["R"] == config.target_radius
     assert meta["seed_id"] == seed.seed_id
     assert meta["regime"] in {"stable", "chaotic"}
+    assert meta["parameter_search"]["curator_version"] == "lenia_parameter_search_v1"
+    assert meta["parameter_search"]["sampling_mode"] in {"center", "wide"}
+    assert meta["parameter_search"]["attempt_count"] >= 1
 
 
 def test_generate_rollouts_writes_manifest_and_summary(tmp_path: Path) -> None:
@@ -150,6 +169,72 @@ def test_generate_rollouts_writes_manifest_and_summary(tmp_path: Path) -> None:
     assert summary["num_successful_episodes"] == len(rows)
     assert "regime_counts" in summary
     assert "perturb_counts" in summary
+    assert summary["parameter_search"]["curator_version"] == "lenia_parameter_search_v1"
+    assert summary["attempted_parameter_sets"] >= len(rows)
+    assert summary["rejected_parameter_sets"] >= 0
+    assert "sampling_mode_counts" in summary
+    assert "parameter_search" in rows[0]
+    assert rows[0]["parameter_search"]["sampling_mode"] in {"center", "wide"}
     assert "mu_range" in summary
     first_path = Path(rows[0]["path"])
     assert first_path.exists()
+
+
+def test_main_accepts_parameter_search_cli_knobs(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_generate_rollouts(output_root, seed_catalog_path, config):
+        captured["output_root"] = output_root
+        captured["seed_catalog_path"] = seed_catalog_path
+        captured["config"] = config
+        return tmp_path / "manifest.jsonl"
+
+    monkeypatch.setattr(lenia_data, "generate_rollouts", fake_generate_rollouts)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "lenia_data",
+            "--seed-catalog",
+            str(tmp_path / "seeds.json"),
+            "--output-root",
+            str(tmp_path / "rollouts"),
+            "--num-seeds",
+            "2",
+            "--mu-min",
+            "0.24",
+            "--mu-max",
+            "0.40",
+            "--sigma-min",
+            "0.034",
+            "--sigma-max",
+            "0.079",
+            "--center-mu-min",
+            "0.28",
+            "--center-mu-max",
+            "0.37",
+            "--center-sigma-min",
+            "0.040",
+            "--center-sigma-max",
+            "0.066",
+            "--center-sampling-ratio",
+            "0.8",
+            "--max-attempts-per-seed",
+            "9",
+        ],
+    )
+
+    lenia_data.main()
+
+    config = captured["config"]
+    assert isinstance(config, RolloutConfig)
+    assert config.num_seeds == 2
+    assert config.mu_min == 0.24
+    assert config.mu_max == 0.40
+    assert config.sigma_min == 0.034
+    assert config.sigma_max == 0.079
+    assert config.center_mu_min == 0.28
+    assert config.center_mu_max == 0.37
+    assert config.center_sigma_min == 0.040
+    assert config.center_sigma_max == 0.066
+    assert config.center_sampling_ratio == 0.8
+    assert config.max_attempts_per_seed == 9

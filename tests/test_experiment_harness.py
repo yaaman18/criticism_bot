@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from trm_pipeline import experiment_harness
 from trm_pipeline.common import save_json
@@ -249,7 +253,209 @@ def test_evaluate_contract_reports_pass_for_candidate_mode(tmp_path: Path) -> No
     assert report["eligible_family_tracks"] == ["energy_starved", "toxic_band"]
     assert report["family_reports"]["energy_starved"]["summary"]["final_improvement_vs_baseline"] > 0.0
     assert report["family_reports"]["toxic_band"]["criteria"]["stress_defensive_rate"]["passed"] is True
+    assert "mean_p_t_min" in report["family_reports"]["energy_starved"]["criteria"]
+    assert "mean_challenge_fraction_min" in report["family_reports"]["energy_starved"]["criteria"]
+    assert "role_switch_events_total" in report["family_reports"]["energy_starved"]["criteria"]
+    assert "mean_aux_nontrivial_action_count" in report["family_reports"]["energy_starved"]["criteria"]
     assert "Promote the candidate for the required family tracks" in report["next_steps"][0]
+
+
+def test_evaluate_contract_holdout_with_seed_leakage_blocks_promotion(tmp_path: Path) -> None:
+    output_root = tmp_path / "harness_eval_holdout"
+    contract = experiment_harness.build_experiment_contract(
+        output_root=output_root,
+        experiment_name="candidate_holdout",
+        seed_start=10,
+        num_seeds=2,
+        holdout_seed_start=10,
+        holdout_num_seeds=2,
+        family_tracks=[
+            {
+                "name": "energy_starved",
+                "promotion_target": "Promote only after holdout confirms improvement.",
+            },
+        ],
+    )
+    compare_root = Path(contract["artifacts"]["compare_root"])
+    energy_root = compare_root / "energy_starved"
+    holdout_root = energy_root / "holdout"
+    for seed in (10, 11):
+        _write_seed_compare(
+            energy_root,
+            seed=seed,
+            candidate_mode=contract["candidate_mode"],
+            baseline_mode=contract["baseline_mode"],
+            candidate_final=0.22,
+            candidate_mean=0.24,
+            baseline_final=0.34,
+            baseline_mean=0.31,
+            candidate_actions=["withdraw", "reconfigure", "withdraw"],
+            candidate_contacts=[(0.45, 0.40), (0.50, 0.42), (0.47, 0.41)],
+            best_mode=contract["candidate_mode"],
+        )
+        _write_seed_compare(
+            holdout_root,
+            seed=seed,
+            candidate_mode=contract["candidate_mode"],
+            baseline_mode=contract["baseline_mode"],
+            candidate_final=0.23,
+            candidate_mean=0.25,
+            baseline_final=0.35,
+            baseline_mean=0.32,
+            candidate_actions=["withdraw", "reconfigure", "withdraw"],
+            candidate_contacts=[(0.45, 0.40), (0.50, 0.42), (0.47, 0.41)],
+            best_mode=contract["candidate_mode"],
+        )
+    save_json(
+        energy_root / "aggregate_summary.json",
+        {
+            "experiment_name": contract["experiment_name"],
+            "candidate_mode": contract["candidate_mode"],
+            "baseline_mode": contract["baseline_mode"],
+            "seed_start": 10,
+            "num_seeds": 2,
+            "per_seed": [
+                {"seed": 10, "best_mode_by_final_homeostasis": contract["candidate_mode"]},
+                {"seed": 11, "best_mode_by_final_homeostasis": contract["candidate_mode"]},
+            ],
+            "counts_by_best_final_homeostasis": {contract["candidate_mode"]: 2},
+            "counts_by_best_mean_homeostasis": {contract["candidate_mode"]: 2},
+        },
+    )
+    save_json(
+        holdout_root / "aggregate_summary.json",
+        {
+            "experiment_name": contract["experiment_name"],
+            "candidate_mode": contract["candidate_mode"],
+            "baseline_mode": contract["baseline_mode"],
+            "seed_start": 10,
+            "num_seeds": 2,
+            "split": "holdout",
+            "per_seed": [
+                {"seed": 10, "best_mode_by_final_homeostasis": contract["candidate_mode"]},
+                {"seed": 11, "best_mode_by_final_homeostasis": contract["candidate_mode"]},
+            ],
+            "counts_by_best_final_homeostasis": {contract["candidate_mode"]: 2},
+            "counts_by_best_mean_homeostasis": {contract["candidate_mode"]: 2},
+        },
+    )
+    save_json(
+        compare_root / "aggregate_summary.json",
+        {
+            "experiment_name": contract["experiment_name"],
+            "candidate_mode": contract["candidate_mode"],
+            "baseline_mode": contract["baseline_mode"],
+            "compare_root": str(compare_root),
+            "family_order": ["energy_starved"],
+            "families": {
+                "energy_starved": {
+                    "aggregate_summary": str(energy_root / "aggregate_summary.json"),
+                    "holdout_aggregate_summary": str(holdout_root / "aggregate_summary.json"),
+                    "required_for_promotion": True,
+                    "promotion_target": "Promote only after holdout confirms improvement.",
+                },
+            },
+        },
+    )
+
+    report = experiment_harness.evaluate_contract(contract)
+    family = report["family_reports"]["energy_starved"]
+    assert report["overall_pass"] is False
+    assert family["overall_pass_holdout"] is True
+    assert family["seed_leakage"]["has_overlap"] is True
+    assert "Seed leakage detected between dev and holdout splits" in family["next_steps"][0]
+
+
+def test_evaluate_contract_handles_missing_aggregate_as_failed_report(tmp_path: Path) -> None:
+    contract = experiment_harness.build_experiment_contract(
+        output_root=tmp_path / "missing_aggregate",
+        experiment_name="missing_aggregate_case",
+        family_tracks=[
+            {
+                "name": "energy_starved",
+                "promotion_target": "Promote when metrics pass.",
+            }
+        ],
+    )
+
+    report = experiment_harness.evaluate_contract(contract)
+    family = report["family_reports"]["energy_starved"]
+
+    assert report["overall_pass"] is False
+    assert family["overall_pass"] is False
+    assert "evaluation_error" in family
+    assert "missing aggregate summary" in family["evaluation_error"]
+
+
+def test_evaluate_contract_requires_holdout_when_configured(tmp_path: Path) -> None:
+    contract = experiment_harness.build_experiment_contract(
+        output_root=tmp_path / "require_holdout",
+        experiment_name="require_holdout_case",
+        seed_start=10,
+        num_seeds=1,
+        holdout_num_seeds=0,
+        require_holdout_for_promotion=True,
+        family_tracks=[
+            {
+                "name": "energy_starved",
+                "promotion_target": "Promote only with holdout.",
+            }
+        ],
+    )
+    compare_root = Path(contract["artifacts"]["compare_root"])
+    energy_root = compare_root / "energy_starved"
+    _write_seed_compare(
+        energy_root,
+        seed=10,
+        candidate_mode=contract["candidate_mode"],
+        baseline_mode=contract["baseline_mode"],
+        candidate_final=0.20,
+        candidate_mean=0.21,
+        baseline_final=0.34,
+        baseline_mean=0.31,
+        candidate_actions=["withdraw", "reconfigure", "withdraw"],
+        candidate_contacts=[(0.45, 0.40), (0.50, 0.42), (0.47, 0.41)],
+        best_mode=contract["candidate_mode"],
+    )
+    save_json(
+        energy_root / "aggregate_summary.json",
+        {
+            "experiment_name": contract["experiment_name"],
+            "candidate_mode": contract["candidate_mode"],
+            "baseline_mode": contract["baseline_mode"],
+            "seed_start": 10,
+            "num_seeds": 1,
+            "per_seed": [
+                {"seed": 10, "best_mode_by_final_homeostasis": contract["candidate_mode"]},
+            ],
+            "counts_by_best_final_homeostasis": {contract["candidate_mode"]: 1},
+            "counts_by_best_mean_homeostasis": {contract["candidate_mode"]: 1},
+        },
+    )
+    save_json(
+        compare_root / "aggregate_summary.json",
+        {
+            "experiment_name": contract["experiment_name"],
+            "candidate_mode": contract["candidate_mode"],
+            "baseline_mode": contract["baseline_mode"],
+            "compare_root": str(compare_root),
+            "family_order": ["energy_starved"],
+            "families": {
+                "energy_starved": {
+                    "aggregate_summary": str(energy_root / "aggregate_summary.json"),
+                    "required_for_promotion": True,
+                    "promotion_target": "Promote only with holdout.",
+                },
+            },
+        },
+    )
+
+    report = experiment_harness.evaluate_contract(contract)
+    family = report["family_reports"]["energy_starved"]
+    assert report["holdout_required_for_promotion"] is True
+    assert report["overall_pass"] is False
+    assert family["overall_pass"] is False
+    assert "Holdout split is required for promotion" in family["next_steps"][0]
 
 
 def test_run_contract_stops_when_doctor_is_blocked(tmp_path: Path, monkeypatch) -> None:
@@ -381,6 +587,59 @@ def test_build_promotion_decision_marks_failed_tracks(tmp_path: Path) -> None:
     assert decision["track_decisions"][0]["failed_criteria"] == ["best_mode_frequency", "stress_defensive_rate"]
 
 
+def test_build_promotion_decision_includes_holdout_and_leakage_reasons(tmp_path: Path) -> None:
+    contract = experiment_harness.build_experiment_contract(
+        output_root=tmp_path / "decision_holdout",
+        experiment_name="decision_holdout_case",
+        family_tracks=[
+            {
+                "name": "energy_starved",
+                "promotion_target": "Promote only after holdout passes.",
+            }
+        ],
+    )
+    eval_report = {
+        "doctor_status": "ok",
+        "overall_pass": False,
+        "required_family_tracks": ["energy_starved"],
+        "eligible_family_tracks": [],
+        "blocked_family_tracks": ["energy_starved"],
+        "family_reports": {
+            "energy_starved": {
+                "overall_pass": False,
+                "required_for_promotion": True,
+                "promotion_target": "Promote only after holdout passes.",
+                "criteria": {
+                    "stress_exploit_rate": {"passed": False},
+                },
+                "criteria_holdout": {
+                    "final_improvement_ci_lower": {"passed": False},
+                },
+                "overall_pass_holdout": False,
+                "seed_leakage": {"has_overlap": True, "overlap_seeds": [10, 11]},
+                "next_steps": ["Rebuild with disjoint holdout seeds."],
+                "summary": {
+                    "candidate": {"mean_final_homeostatic_error": 0.34},
+                    "baseline": {"mean_final_homeostatic_error": 0.28},
+                },
+            }
+        },
+        "next_steps": ["Keep `energy_starved` below promotion."],
+    }
+
+    decision = experiment_harness.build_promotion_decision(contract, eval_report=eval_report)
+    track = decision["track_decisions"][0]
+
+    assert decision["status"] == "revise"
+    assert "blocked:" in decision["ci_summary"]
+    assert "seed_leakage" in decision["ci_summary"]
+    assert track["holdout_enabled"] is True
+    assert track["holdout_pass"] is False
+    assert track["seed_leakage_overlap"] is True
+    assert "seed_leakage" in track["failure_reasons"]
+    assert "holdout_fail" in track["failure_reasons"]
+
+
 def test_apply_tuning_updates_clamps_and_targets_blocked_tracks(tmp_path: Path) -> None:
     contract = experiment_harness.build_experiment_contract(
         output_root=tmp_path / "tune_contract",
@@ -414,6 +673,69 @@ def test_apply_tuning_updates_clamps_and_targets_blocked_tracks(tmp_path: Path) 
     assert tracks["fragile_boundary"]["runtime_overrides"]["aperture_gain"] == 0.60
     assert len(applied) == 1
     assert applied[0]["track"] == "energy_starved"
+
+
+def test_propose_tuning_updates_handles_intake_lock_criteria() -> None:
+    eval_report = {
+        "required_family_tracks": ["energy_starved"],
+        "blocked_family_tracks": ["energy_starved"],
+        "family_reports": {
+            "energy_starved": {
+                "required_for_promotion": True,
+                "criteria": {
+                    "intake_rate": {"passed": False},
+                    "action_diversity": {"passed": False},
+                    "navigation_rate": {"passed": False},
+                },
+            }
+        },
+    }
+    proposals = experiment_harness._propose_tuning_updates(eval_report, max_updates_per_round=3)
+    params = [row["param"] for row in proposals]
+
+    assert "aperture_gain" in params
+    assert "action_gating_blend" in params
+    assert "move_step" in params
+
+
+def test_propose_tuning_updates_handles_trace_ablation_criteria() -> None:
+    eval_report = {
+        "required_family_tracks": ["energy_starved"],
+        "blocked_family_tracks": ["energy_starved"],
+        "family_reports": {
+            "energy_starved": {
+                "required_for_promotion": True,
+                "criteria": {
+                    "trace_ablation_spawn_delta": {"passed": False},
+                },
+            }
+        },
+    }
+    proposals = experiment_harness._propose_tuning_updates(eval_report, max_updates_per_round=2)
+    params = [row["param"] for row in proposals]
+
+    assert "move_step" in params
+    assert "aperture_width_deg" in params
+
+
+def test_propose_tuning_updates_handles_role_distribution_criteria() -> None:
+    eval_report = {
+        "required_family_tracks": ["energy_starved"],
+        "blocked_family_tracks": ["energy_starved"],
+        "family_reports": {
+            "energy_starved": {
+                "required_for_promotion": True,
+                "criteria": {
+                    "role_switch_events_total": {"passed": False},
+                },
+            }
+        },
+    }
+    proposals = experiment_harness._propose_tuning_updates(eval_report, max_updates_per_round=2)
+    params = [row["param"] for row in proposals]
+
+    assert "move_step" in params
+    assert "lookahead_horizon" in params
 
 
 def test_run_tuning_loop_stops_on_promotion(tmp_path: Path, monkeypatch) -> None:
@@ -475,8 +797,199 @@ def test_run_tuning_loop_stops_on_promotion(tmp_path: Path, monkeypatch) -> None
     )
 
     assert summary["status"] == "promote"
-    assert summary["rounds_run"] == 2
-    assert call_count["n"] == 2
+    assert summary["rounds_run"] == 3
+    assert call_count["n"] == 3
     assert Path(summary["tune_summary_path"]).exists()
+    assert Path(summary["recommended_contract_path"]).exists()
+    assert summary["selected_round"] == 2
     assert (tmp_path / "tune_run" / "autotune" / "round_01" / "contract.json").exists()
     assert (tmp_path / "tune_run" / "autotune" / "round_02" / "contract.json").exists()
+    assert (tmp_path / "tune_run" / "autotune" / "round_03" / "contract.json").exists()
+
+
+def test_run_tuning_loop_apply_best_updates_contract_with_recommended(tmp_path: Path, monkeypatch) -> None:
+    contract = experiment_harness.build_experiment_contract(
+        output_root=tmp_path / "tune_apply_best",
+        experiment_name="tune_apply_best",
+        family_tracks=[
+            {
+                "name": "energy_starved",
+                "runtime_overrides": {"aperture_gain": 0.50},
+                "promotion_target": "Promote only after energy-starved track improves.",
+            },
+            {
+                "name": "fragile_boundary",
+                "runtime_overrides": {"aperture_gain": 0.60},
+                "promotion_target": "Keep fragile-boundary stable.",
+            },
+        ],
+    )
+    contract_path = Path(contract["artifacts"]["contract"])
+    save_json(contract_path, contract)
+    call_count = {"n": 0}
+
+    def fake_run_contract(round_contract, *, force=False, skip_doctor=False):
+        call_count["n"] += 1
+        passed = call_count["n"] >= 2
+        eval_report = {
+            "overall_pass": passed,
+            "required_family_tracks": ["energy_starved", "fragile_boundary"],
+            "eligible_family_tracks": ["energy_starved", "fragile_boundary"] if passed else [],
+            "blocked_family_tracks": [] if passed else ["energy_starved"],
+            "family_reports": {
+                "energy_starved": {
+                    "required_for_promotion": True,
+                    "summary": {
+                        "candidate": {
+                            "mean_final_homeostatic_error": 0.22 if passed else 0.36,
+                        }
+                    },
+                    "criteria": {
+                        "stress_exploit_rate": {"passed": passed},
+                        "mean_final_homeostatic_error": {"passed": passed},
+                    },
+                },
+                "fragile_boundary": {
+                    "required_for_promotion": True,
+                    "summary": {
+                        "candidate": {
+                            "mean_final_homeostatic_error": 0.24 if passed else 0.25,
+                        }
+                    },
+                    "criteria": {
+                        "stress_exploit_rate": {"passed": True},
+                        "mean_final_homeostatic_error": {"passed": True},
+                    },
+                },
+            },
+            "next_steps": [],
+        }
+        save_json(round_contract["artifacts"]["eval_report"], eval_report)
+        save_json(
+            round_contract["artifacts"]["run_summary"],
+            {
+                "status": "passed" if passed else "failed",
+                "experiment_name": round_contract["experiment_name"],
+            },
+        )
+        return {"status": "passed" if passed else "failed"}
+
+    monkeypatch.setattr(experiment_harness, "run_contract", fake_run_contract)
+
+    summary = experiment_harness.run_tuning_loop(
+        contract_path,
+        max_rounds=3,
+        min_primary_improvement=0.001,
+        stagnation_patience=1,
+        max_updates_per_round=2,
+        apply_best=True,
+    )
+
+    assert summary["status"] == "promote"
+    assert summary["applied_contract_path"] == str(contract_path)
+    assert summary["recommended_contract_path"].endswith("recommended_contract.json")
+    recommended = json.loads(Path(summary["recommended_contract_path"]).read_text(encoding="utf-8"))
+    applied = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert applied == recommended
+
+    tracks = {track["name"]: track for track in applied["family_tracks"]}
+    assert tracks["energy_starved"]["runtime_overrides"]["aperture_gain"] == pytest.approx(0.46)
+    assert tracks["energy_starved"]["runtime_overrides"]["action_gating_blend"] == pytest.approx(0.40)
+    assert tracks["fragile_boundary"]["runtime_overrides"]["aperture_gain"] == pytest.approx(0.60)
+
+
+def test_run_tuning_loop_resume_continues_from_existing_rounds(tmp_path: Path, monkeypatch) -> None:
+    contract = experiment_harness.build_experiment_contract(
+        output_root=tmp_path / "tune_resume",
+        experiment_name="tune_resume_case",
+        family_tracks=[
+            {
+                "name": "energy_starved",
+                "promotion_target": "Promote after confirmation.",
+            }
+        ],
+    )
+    contract_path = Path(contract["artifacts"]["contract"])
+    save_json(contract_path, contract)
+    call_count = {"n": 0}
+
+    def fake_run_contract(round_contract, *, force=False, skip_doctor=False):
+        call_count["n"] += 1
+        passed = call_count["n"] >= 2
+        eval_report = {
+            "overall_pass": passed,
+            "required_family_tracks": ["energy_starved"],
+            "eligible_family_tracks": ["energy_starved"] if passed else [],
+            "blocked_family_tracks": [] if passed else ["energy_starved"],
+            "family_reports": {
+                "energy_starved": {
+                    "required_for_promotion": True,
+                    "summary": {
+                        "candidate": {
+                            "mean_final_homeostatic_error": 0.21 if passed else 0.33,
+                        }
+                    },
+                    "criteria": {
+                        "stress_exploit_rate": {"passed": passed},
+                    },
+                }
+            },
+            "next_steps": [],
+        }
+        save_json(round_contract["artifacts"]["eval_report"], eval_report)
+        save_json(
+            round_contract["artifacts"]["run_summary"],
+            {
+                "status": "passed" if passed else "failed",
+                "experiment_name": round_contract["experiment_name"],
+            },
+        )
+        return {"status": "passed" if passed else "failed"}
+
+    monkeypatch.setattr(experiment_harness, "run_contract", fake_run_contract)
+
+    first = experiment_harness.run_tuning_loop(
+        contract_path,
+        max_rounds=1,
+        promotion_streak_required=1,
+    )
+    assert first["rounds_run"] == 1
+    assert first["status"] == "max_rounds"
+
+    resumed = experiment_harness.run_tuning_loop(
+        contract_path,
+        max_rounds=3,
+        promotion_streak_required=1,
+        resume=True,
+    )
+    assert resumed["resumed"] is True
+    assert resumed["start_round_index"] == 2
+    assert resumed["rounds_run"] == 2
+    assert resumed["status"] == "promote"
+    assert call_count["n"] == 2
+
+
+def test_check_promotion_decision_script_returns_expected_exit_codes(tmp_path: Path) -> None:
+    decision_promote = tmp_path / "promote.json"
+    decision_revise = tmp_path / "revise.json"
+    save_json(
+        decision_promote,
+        {"status": "promote", "ci_summary": "promote: energy_starved"},
+    )
+    save_json(
+        decision_revise,
+        {"status": "revise", "ci_summary": "blocked: energy_starved(seed_leakage)"},
+    )
+
+    ok = subprocess.run(
+        [sys.executable, "scripts/check_promotion_decision.py", "--decision", str(decision_promote)],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+    )
+    ng = subprocess.run(
+        [sys.executable, "scripts/check_promotion_decision.py", "--decision", str(decision_revise)],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+    )
+    assert ok.returncode == 0
+    assert ng.returncode == 1

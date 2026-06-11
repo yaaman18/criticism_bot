@@ -350,12 +350,15 @@ make production-finalize
 Lenia 上で最小の ERIE 自己維持ループを試すための runtime を `trm_pipeline/erie_runtime.py` に追加しています。
 この段階では次を持ちます。
 
-- `resource / hazard / shelter` 環境場
+- `energy_gradient / thermal_stress / toxicity / niche_stability / flow` 外部状態場
 - `occupancy / boundary / permeability` による空間 body
 - boundary interface 越しの観測
 - precision-weighted belief update
 - `Risk + Ambiguity - Epistemic` による policy scoring
 - `G_t / B_t` viability と death criterion
+
+旧 `resource / hazard / shelter` は互換 alias として残しています。
+正規語彙は [2026-04-26_外部状態語彙統一.md](2026-04-26_外部状態語彙統一.md) に固定しています。
 
 実行例:
 
@@ -398,14 +401,62 @@ Lenia 上で最小の ERIE 自己維持ループを試すための runtime を `
 
 - `--lookahead-horizon`, `--lookahead-discount`
   policy score の先読み深さと割引率
+- `--energy-gradient-patches`, `--thermal-stress-patches`, `--niche-stability-patches`
+  正規の外部状態場生成ノブ
 - `--resource-patches`, `--hazard-patches`, `--shelter-patches`
-  Lenia 環境場の粗い難度設定
+  互換 CLI。正規フラグ未指定時だけ `energy_gradient`, `thermal_stress / toxicity`, `niche_stability` の粗い場生成数として解決する
 
 出力:
 
 - `*_summary.json`: 生存結果と action 集計
 - `*_history.json`: step ごとの belief / policy / viability ログ
 - `*.npz`: occupancy, boundary, permeability, env_channels などの時系列
+
+Adaptive controller を有効にすると、実行中の短い時間窓から homeostatic error,
+policy entropy, external-state contact を読み、主体側の runtime パラメータと
+Lenia `m/s` だけを安全範囲内で微調整します。外部状態場そのものを都合よく
+書き換えるものではありません。
+
+```bash
+./.venv/bin/python -m trm_pipeline.erie_runtime \
+  --output-root artifacts/erie_adaptive_smoke \
+  --steps 32 \
+  --warmup-steps 2 \
+  --adaptive-controller \
+  --adaptive-interval 4 \
+  --adaptive-window-size 8
+```
+
+有効時は追加で `*_parameter_history.json` が出力され、各更新の window metrics,
+旧値, 新値, delta が保存されます。`*_summary.json` には
+`adaptive_controller`, `adaptive_event_count`, `final_lenia_params` が入ります。
+
+世代単位で複数candidateを評価・選択・変異・継承する場合は
+`generation_harness` を使います。現段階の genome は主体側の runtime
+パラメータと Lenia `m/s` です。
+
+```bash
+./.venv/bin/python -m trm_pipeline.generation_harness \
+  --output-root artifacts/generation_harness_smoke \
+  --generations 2 \
+  --population-size 3 \
+  --elite-count 1 \
+  --episodes-per-candidate 1 \
+  --steps 16 \
+  --environment-regimes easy sparse_energy toxic_band hard
+```
+
+出力:
+
+- `generation_summary.json`: 世代ごとの best / mean fitness と最終best
+- `generation_candidates.jsonl`: 各candidateの genome, inherited_genome, aggregate metrics, regime別fitness
+- `selected_genome.json`: 次回実行や手動検証に使える継承済みbest genome
+- `generation_*/candidate_*/<regime>/episode_*`: 各episodeの通常runtime artifact
+
+`--environment-regimes` は `balanced`, `easy`, `resource_rich`,
+`sparse_energy`, `toxic_band`, `thermal_stress`, `unstable_niche`, `hard`
+から選びます。candidate選択は平均fitnessだけでなく `worst_regime_fitness`
+を含む `generalization_score` を使うため、単一環境への過適応を抑えます。
 
 ## 8.6 TRM-Vm / TRM-As Bootstrap Pipeline
 
@@ -440,6 +491,44 @@ bootstrap cache 生成:
 
 `dataset_harness` / `production_runner` はこの `role_view_manifests` を検出すると、
 `TRM-Wp / Bd / Bp / Vm / As` の学習計画に自動で反映します。view manifest がない dataset は従来どおり canonical manifest を使います。
+
+cache summary / manifest には正規 external-state 契約も入ります。
+
+- `environment_config_canonical`: `energy_gradient / thermal_stress / toxicity / niche_stability / flow` ベースの環境設定
+- `external_state_fields`, `external_state_contact`: 正規外部状態 contact の集計
+- `intervention_*`: 実行 action の前後で contact / viability がどう変わったかを示す action-conditioned transition
+
+`agentic_canonical` / `agentic_production` preset では `require_external_state_gate` を有効にし、外部状態 field の欠落や contact collapse を dataset 評価で止めます。
+
+passive Lenia dataset を `dataset_harness plan/run` から作る場合も、Lenia parameter search ノブは contract に保存されます。
+
+```bash
+./.venv/bin/python -m trm_pipeline.dataset_harness plan \
+  --dataset-kind passive_lenia_pretrain \
+  --dataset-name passive_lenia_curated \
+  --output-root artifacts/passive_lenia_curated \
+  --mu-min 0.23 \
+  --mu-max 0.41 \
+  --sigma-min 0.033 \
+  --sigma-max 0.080 \
+  --center-sampling-ratio 0.7 \
+  --max-attempts-per-seed 12
+```
+
+agentic dataset を複数 `policy_mode` で merge した場合も、top-level `summary.json` に `external_state_fields`, `external_state_contact`, `aggregate_intervention_contact_delta_abs_mean` が残ります。
+同時に top-level の `views/*.jsonl` も再生成されるため、`dataset_harness` の training plan は mode merge 後の dataset でも role-specific manifest を使えます。
+
+agentic dataset harness でも正規外部状態ノブを指定できます。
+
+```bash
+./.venv/bin/python -m trm_pipeline.dataset_harness plan \
+  --dataset-kind agentic_bootstrap \
+  --dataset-name agentic_external_state \
+  --output-root artifacts/agentic_external_state \
+  --energy-gradient-patches 4 \
+  --thermal-stress-patches 3 \
+  --niche-stability-patches 1
+```
 
 `TRM-Wp` の multispecies world-prediction 学習:
 
@@ -636,6 +725,19 @@ make dataset-smoke
   --families toxic_band fragile_boundary
 ```
 
+dev/holdout を分離した contract を作る場合（推奨）:
+
+```bash
+./.venv/bin/python -m trm_pipeline.experiment_harness plan \
+  --output-root artifacts/harness_stage2 \
+  --experiment-name vm_as_stage2 \
+  --seed-start 20260318 \
+  --num-seeds 8 \
+  --holdout-seed-start 20260418 \
+  --holdout-num-seeds 4 \
+  --require-holdout-for-promotion
+```
+
 環境チェックだけ先に走らせる場合:
 
 ```bash
@@ -657,6 +759,40 @@ gate fail 時に bounded な自動微調整ラウンドを回す場合:
   --max-rounds 3
 ```
 
+`tune` は既定で `promotion_streak_required=2`（2連続 pass）です。
+必要なら `--promotion-streak-required` で変更できます。
+また、個体挙動の退化を防ぐために `eval_report` の gate は
+`action_diversity` / `intake_rate` / `navigation_rate` も監視します
+（intake 偏重ロックと静的挙動を promotion から除外）。
+
+中断した `tune` を再開する場合:
+
+```bash
+./.venv/bin/python -m trm_pipeline.experiment_harness tune \
+  --contract artifacts/harness_stage1/contract.json \
+  --max-rounds 6 \
+  --resume
+```
+
+best round を本契約へ反映して次の run に直接つなぐ場合:
+
+```bash
+./.venv/bin/python -m trm_pipeline.experiment_harness tune \
+  --contract artifacts/harness_stage1/contract.json \
+  --max-rounds 3 \
+  --apply-best
+```
+
+推奨契約のみ出力して手動で再実行したい場合は
+`artifacts/harness_stage1/autotune/recommended_contract.json` を使います。
+
+標準フロー:
+
+1. `plan` で contract を作る
+2. `run` で baseline gate 判定まで回す
+3. `tune` で反復微調整する
+4. `recommended_contract.json`（または `--apply-best` 済み contract）で再度 `run`
+
 関連仕様:
 
 - [TRM_AG_TUNING_REQUIREMENTS.md](/Users/yamaguchimitsuyuki/criticism_bot/TRM_AG_TUNING_REQUIREMENTS.md)
@@ -668,8 +804,22 @@ gate fail 時に bounded な自動微調整ラウンドを回す場合:
 - `compare/<family>/aggregate_summary.json`: family 別 multi-seed sweep 集計
 - `compare/aggregate_summary.json`: family index と promotion target
 - `eval_report.json`: family-aware gate 判定と promotion 可否
-- `promotion_decision.json`: 昇格判断を family ごとに潰した最終判定
+- `eval_report.json` には holdout 判定、seed leakage 判定、`final_improvement` の bootstrap CI が含まれます
+- `promotion_decision.json`: 昇格判断を family ごとに潰した最終判定（`ci_summary` に失敗理由を1行集約）
 - `next_steps.json`: 次ラウンドで何を直すかの短い handoff
+
+CI で判定だけを実行する場合:
+
+```bash
+./.venv/bin/python ./scripts/check_promotion_decision.py \
+  --decision artifacts/harness_stage1/promotion_decision.json
+```
+
+Make 経由:
+
+```bash
+make promotion-check DECISION=artifacts/harness_stage1/promotion_decision.json
+```
 
 CI でも `bootstrap -> doctor -> test -> harness-smoke` を回すので、
 ローカルと同じ入口で実行環境と最小ハーネスの両方を壊さないようにしています。
@@ -748,9 +898,8 @@ VastAI での一括実行:
 ERIE runtime の `.npz` を openFrameworks 用の texture sequence に変換できます。
 
 ```bash
-./.venv/bin/python -m trm_pipeline.export_erie_openframeworks_frames \
-  --npz artifacts/lenia_runtime_check/erie_20260318_seed_000510.npz \
-  --output-root artifacts/of_viewer_export_smoke
+./scripts/prepare_erie_life_viewer.sh \
+  --npz artifacts/multispecies_runtime_check/erie_20260404_seed_000215.npz
 ```
 
 出力:
@@ -760,6 +909,8 @@ ERIE runtime の `.npz` を openFrameworks 用の texture sequence に変換で�
 - `frames/field_*.png`
 - `frames/body_*.png`
 - `frames/aura_*.png`
+
+このスクリプトは export・`bin/data/session` への同期・viewer build まで実行します。
 
 openFrameworks 側の viewer skeleton と GLSL shader は
 [openframeworks/erie_life_viewer/README.md](/Users/yamaguchimitsuyuki/criticism_bot/openframeworks/erie_life_viewer/README.md)

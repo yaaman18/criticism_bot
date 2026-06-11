@@ -5,6 +5,7 @@ from collections import Counter
 from pathlib import Path
 
 from .common import ensure_dir, load_json, save_json
+from .erie_runtime import add_environment_config_args, environment_config_from_args
 from .prepare_trm_va_data import EPISODE_FAMILIES
 from .sweep_trm_mc_modes import _compare_one_seed
 
@@ -49,9 +50,7 @@ def main() -> None:
     parser.add_argument("--warmup-steps", type=int, default=4)
     parser.add_argument("--lookahead-horizon", type=int, default=2)
     parser.add_argument("--lookahead-discount", type=float, default=0.85)
-    parser.add_argument("--resource-patches", type=int, default=3)
-    parser.add_argument("--hazard-patches", type=int, default=3)
-    parser.add_argument("--shelter-patches", type=int, default=1)
+    add_environment_config_args(parser)
     parser.add_argument("--trm-a-checkpoint", default=None)
     parser.add_argument("--trm-b-checkpoint", default=None)
     parser.add_argument("--module-manifest", default=None)
@@ -80,6 +79,7 @@ def main() -> None:
     )
     parser.add_argument("--defensive-family-bias", type=float, default=2.0)
     args = parser.parse_args()
+    cli_env_config = environment_config_from_args(args)
 
     output_root = ensure_dir(args.output_root)
     family_summaries: dict[str, dict] = {}
@@ -104,9 +104,9 @@ def main() -> None:
                 seed=seed,
                 lookahead_horizon=args.lookahead_horizon,
                 lookahead_discount=args.lookahead_discount,
-                resource_patches=args.resource_patches,
-                hazard_patches=args.hazard_patches,
-                shelter_patches=args.shelter_patches,
+                resource_patches=cli_env_config.resource_patches,
+                hazard_patches=cli_env_config.hazard_patches,
+                shelter_patches=cli_env_config.shelter_patches,
                 trm_a_checkpoint=args.trm_a_checkpoint,
                 trm_b_checkpoint=args.trm_b_checkpoint,
                 module_manifest=args.module_manifest,

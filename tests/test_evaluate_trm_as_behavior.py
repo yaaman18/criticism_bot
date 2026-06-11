@@ -45,6 +45,7 @@ def test_evaluate_compare_root_reports_stress_action_diagnostics(tmp_path: Path)
         "results": {
             "analytic__module_primary": {
                 "runtime_config": {"G_target": 0.55, "B_target": 0.65},
+                "mean_trace_ablation_spawn_delta": 0.12,
             }
         },
     }
@@ -61,3 +62,12 @@ def test_evaluate_compare_root_reports_stress_action_diagnostics(tmp_path: Path)
     assert diag["stress_step_fraction"] == 2 / 3
     assert diag["stress_exploit_rate"] == 0.5
     assert diag["stress_defensive_rate"] == 0.5
+    assert diag["action_diversity"] > 0.0
+    assert diag["intake_rate"] == 1 / 3
+    assert diag["navigation_rate"] == 2 / 3
+    assert diag["trace_ablation_spawn_delta"] == 0.12
+    assert "mean_p_t" in diag
+    assert "mean_challenge_fraction" in diag
+    assert "mean_aux_policy_entropy" in diag
+    assert "aux_full_policy_rate" in diag
+    assert "mean_aux_nontrivial_action_count" in diag

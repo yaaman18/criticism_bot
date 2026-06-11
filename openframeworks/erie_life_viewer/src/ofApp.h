@@ -17,7 +17,7 @@ public:
     void keyPressed(int key) override;
 
 private:
-    bool loadSession(const ofFilePath& manifestPath);
+    bool loadSession(const std::string& manifestPath);
     bool loadFrame(std::size_t frameIndex);
     void updatePlayback();
     void drawHud() const;

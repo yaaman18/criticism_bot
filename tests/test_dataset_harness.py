@@ -25,6 +25,255 @@ def test_build_dataset_contract_sets_collection_artifacts(tmp_path: Path) -> Non
     assert Path(contract["artifacts"]["training_plan"]) == tmp_path / "dataset_run" / "training_plan.json"
 
 
+def test_passive_collection_forwards_lenia_parameter_search_config(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    contract = dataset_harness.build_dataset_contract(
+        output_root=tmp_path / "dataset_collect",
+        dataset_name="passive_collect",
+        dataset_kind=dataset_harness.DATASET_KIND_PASSIVE,
+        num_seeds=2,
+        record_steps=8,
+        mu_min=0.24,
+        mu_max=0.40,
+        sigma_min=0.034,
+        sigma_max=0.079,
+        center_mu_min=0.28,
+        center_mu_max=0.37,
+        center_sigma_min=0.040,
+        center_sigma_max=0.066,
+        center_sampling_ratio=0.8,
+        max_attempts_per_seed=9,
+        registry_path=tmp_path / "dataset_registry.jsonl",
+    )
+
+    def fake_generate_rollouts(output_root, seed_catalog_path, config):
+        captured["output_root"] = output_root
+        captured["seed_catalog_path"] = seed_catalog_path
+        captured["config"] = config
+        root = Path(output_root)
+        root.mkdir(parents=True, exist_ok=True)
+        manifest = root / "manifest.jsonl"
+        manifest.write_text("", encoding="utf-8")
+        (root / "summary.json").write_text(
+            json.dumps({"num_selected_seeds": 2, "num_successful_episodes": 0}),
+            encoding="utf-8",
+        )
+        return manifest
+
+    monkeypatch.setattr(dataset_harness, "generate_rollouts", fake_generate_rollouts)
+
+    result = dataset_harness._run_collection_from_contract(contract)
+
+    config = captured["config"]
+    assert result["manifest_path"].endswith("manifest.jsonl")
+    assert config.mu_min == 0.24
+    assert config.mu_max == 0.40
+    assert config.sigma_min == 0.034
+    assert config.sigma_max == 0.079
+    assert config.center_mu_min == 0.28
+    assert config.center_mu_max == 0.37
+    assert config.center_sigma_min == 0.040
+    assert config.center_sigma_max == 0.066
+    assert config.center_sampling_ratio == 0.8
+    assert config.max_attempts_per_seed == 9
+
+
+def test_agentic_collection_merge_preserves_external_state_summary(tmp_path: Path, monkeypatch) -> None:
+    contract = dataset_harness.build_dataset_contract(
+        output_root=tmp_path / "agentic_collect",
+        dataset_name="agentic_collect",
+        dataset_kind=dataset_harness.DATASET_KIND_AGENTIC,
+        episodes=4,
+        policy_mode_mix={"closed_loop": 0.5, "random": 0.5},
+        required_families=["energy_starved"],
+        resource_patches=5,
+        hazard_patches=4,
+        shelter_patches=2,
+        min_episode_samples=1,
+        min_distinct_actions=1,
+        min_episode_policy_entropy=0.0,
+        registry_path=tmp_path / "dataset_registry.jsonl",
+    )
+
+    def fake_prepare_trm_va_cache(
+        seed_catalog,
+        output_root,
+        runtime_config,
+        env_config,
+        num_episodes,
+        **kwargs,
+    ):
+        root = Path(output_root)
+        root.mkdir(parents=True, exist_ok=True)
+        manifest = root / "manifest.jsonl"
+        rows = [
+            {
+                "episode_id": f"{runtime_config.policy_mode}_{idx}",
+                "seed_id": f"seed_{idx}",
+                "split": "train",
+                "path": str(root / f"{runtime_config.policy_mode}_{idx}.npz"),
+                "episode_family": "energy_starved",
+                "policy_mode": runtime_config.policy_mode,
+                "num_samples": 2,
+                "num_pairs": 2,
+                "terminal_dead": False,
+                "quality": {"num_samples": 2, "terminal_dead": False},
+                "species_context": {
+                    "multispecies_enabled": True,
+                    "species_roles": ["species_energy", "species_toxic", "species_niche"],
+                },
+                "external_state_contact": {
+                    "fields": [
+                        "energy_gradient",
+                        "thermal_stress",
+                        "toxicity",
+                        "niche_stability",
+                    ]
+                },
+                "intervention_summary": {
+                    "contact_delta_key": "intervention_contact_delta",
+                },
+                "runtime_config": runtime_config.__dict__,
+                "environment_config": env_config.__dict__,
+                "environment_config_canonical": {"energy_gradient_patches": 1},
+            }
+            for idx in range(num_episodes)
+        ]
+        manifest.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+        (root / "summary.json").write_text(
+            json.dumps(
+                {
+                    "retained_episodes": num_episodes,
+                    "rejected_episodes": 0,
+                    "attempted_episodes": num_episodes,
+                    "family_counts": {"energy_starved": num_episodes},
+                    "aggregate_action_counts": {
+                        "approach": num_episodes,
+                        "intake": 0,
+                        "withdraw": 0,
+                        "seal": 0,
+                        "reconfigure": 0,
+                    },
+                    "aggregate_policy_entropy_mean": 0.5,
+                    "aggregate_recovery_fraction_mean": 0.5,
+                    "aggregate_stress_defensive_fraction_mean": 0.5,
+                    "aggregate_stress_exploit_fraction_mean": 0.1,
+                    "external_state_fields": [
+                        "energy_gradient",
+                        "thermal_stress",
+                        "toxicity",
+                        "niche_stability",
+                    ],
+                    "external_state_contact": {
+                        "fields": [
+                            "energy_gradient",
+                            "thermal_stress",
+                            "toxicity",
+                            "niche_stability",
+                        ],
+                        "mean": {
+                            "energy_gradient": 0.2,
+                            "thermal_stress": 0.3,
+                            "toxicity": 0.4,
+                            "niche_stability": 0.5,
+                        },
+                        "std": {
+                            "energy_gradient": 0.06,
+                            "thermal_stress": 0.07,
+                            "toxicity": 0.08,
+                            "niche_stability": 0.09,
+                        },
+                        "min_std": 0.06,
+                        "num_samples": num_episodes * 2,
+                    },
+                    "aggregate_intervention_contact_delta_abs_mean": 0.03,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return manifest
+
+    monkeypatch.setattr(dataset_harness, "prepare_trm_va_cache", fake_prepare_trm_va_cache)
+
+    dataset_harness._run_collection_from_contract(contract)
+
+    summary = json.loads(
+        (Path(contract["artifacts"]["dataset_root"]) / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["external_state_fields"] == [
+        "energy_gradient",
+        "thermal_stress",
+        "toxicity",
+        "niche_stability",
+    ]
+    assert summary["external_state_contact"]["min_std"] == 0.06
+    assert summary["external_state_contact"]["num_samples"] == 8
+    assert summary["aggregate_intervention_contact_delta_abs_mean"] == 0.03
+    assert set(summary["role_view_manifests"]) == {
+        "trm_wp",
+        "trm_bd",
+        "trm_bp",
+        "trm_vm",
+        "trm_as",
+        "trm_ag",
+        "trm_mc",
+    }
+    trm_mc_rows = [
+        json.loads(line)
+        for line in Path(summary["role_view_manifests"]["trm_mc"]).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert trm_mc_rows[0]["intervention_contact_delta_key"] == "intervention_contact_delta"
+    assert trm_mc_rows[0]["environment_config"]["resource_patches"] == 5
+
+
+def test_plan_cli_accepts_canonical_external_state_knobs(tmp_path: Path, monkeypatch) -> None:
+    output_root = tmp_path / "agentic_plan"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "dataset_harness",
+            "plan",
+            "--dataset-kind",
+            dataset_harness.DATASET_KIND_AGENTIC,
+            "--dataset-name",
+            "agentic_env",
+            "--output-root",
+            str(output_root),
+            "--episodes",
+            "3",
+            "--energy-gradient-patches",
+            "6",
+            "--thermal-stress-patches",
+            "4",
+            "--niche-stability-patches",
+            "2",
+            "--policy-mode-mix",
+            "closed_loop=0.5",
+            "random=0.25",
+            "--policy-mode-mix",
+            "no_action=0.25",
+        ],
+    )
+
+    dataset_harness.main()
+
+    contract = json.loads((output_root / "contract.json").read_text(encoding="utf-8"))
+    cfg = contract["generator"]["config"]
+    assert cfg["resource_patches"] == 6
+    assert cfg["hazard_patches"] == 4
+    assert cfg["shelter_patches"] == 2
+    assert cfg["policy_mode_mix"] == {
+        "closed_loop": 0.5,
+        "random": 0.25,
+        "no_action": 0.25,
+    }
+
+
 def test_evaluate_passive_dataset_reports_pass_on_balanced_manifest(tmp_path: Path) -> None:
     contract = dataset_harness.build_dataset_contract(
         output_root=tmp_path / "passive_eval",
@@ -125,6 +374,96 @@ def test_evaluate_agentic_dataset_requires_family_coverage(tmp_path: Path) -> No
     assert report["summary"]["missing_required_families"] == ["vent_edge"]
     assert decision["status"] == "revise"
     assert "required_family_coverage" in decision["failed_criteria"]
+
+
+def test_evaluate_agentic_dataset_can_gate_external_state_contact(tmp_path: Path) -> None:
+    contract = dataset_harness.build_dataset_contract(
+        output_root=tmp_path / "agentic_external_gate",
+        dataset_name="agentic_external_gate",
+        dataset_kind=dataset_harness.DATASET_KIND_AGENTIC,
+        episodes=2,
+        required_families=["energy_starved"],
+        registry_path=tmp_path / "dataset_registry.jsonl",
+        acceptance={
+            "min_retained_episodes": 2,
+            "required_families": ["energy_starved"],
+            "min_distinct_families": 1,
+            "max_rejected_fraction": 0.5,
+            "min_aggregate_policy_entropy": 0.0,
+            "min_action_entropy_ratio": 0.0,
+            "max_aggregate_dominant_action_fraction": 1.0,
+            "min_recovery_fraction": 0.0,
+            "min_stress_defensive_fraction": 0.0,
+            "max_stress_exploit_fraction": 1.0,
+            "require_external_state_gate": True,
+            "min_external_contact_std": 0.05,
+        },
+    )
+    dataset_root = Path(contract["artifacts"]["dataset_root"])
+    dataset_root.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {
+            "episode_id": f"va_ext_{index}",
+            "seed_id": f"seed_{index}",
+            "episode_family": "energy_starved",
+            "policy_mode": "closed_loop",
+            "num_samples": 4,
+            "terminal_dead": False,
+            "environment_config_canonical": {"energy_gradient_patches": 1},
+        }
+        for index in range(2)
+    ]
+    (dataset_root / "manifest.jsonl").write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    (dataset_root / "summary.json").write_text(
+        json.dumps(
+            {
+                "retained_episodes": 2,
+                "rejected_episodes": 0,
+                "attempted_episodes": 2,
+                "family_counts": {"energy_starved": 2},
+                "policy_mode_counts": {"closed_loop": 2},
+                "aggregate_action_counts": {
+                    "approach": 8,
+                    "intake": 0,
+                    "withdraw": 0,
+                    "seal": 0,
+                    "reconfigure": 0,
+                },
+                "aggregate_policy_entropy_mean": 0.0,
+                "aggregate_recovery_fraction_mean": 0.0,
+                "aggregate_stress_defensive_fraction_mean": 0.0,
+                "aggregate_stress_exploit_fraction_mean": 0.0,
+                "external_state_fields": [
+                    "energy_gradient",
+                    "thermal_stress",
+                    "toxicity",
+                    "niche_stability",
+                ],
+                "external_state_contact": {
+                    "std": {
+                        "energy_gradient": 0.0,
+                        "thermal_stress": 0.0,
+                        "toxicity": 0.0,
+                        "niche_stability": 0.0,
+                    },
+                    "min_std": 0.0,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    report = dataset_harness.evaluate_dataset_contract(contract)
+    decision = dataset_harness.build_collection_decision(contract, eval_report=report)
+
+    assert report["overall_pass"] is False
+    assert report["criteria"]["external_state_fields_present"]["passed"] is True
+    assert report["criteria"]["external_state_contact_variability"]["passed"] is False
+    assert "external_state_contact_variability" in decision["failed_criteria"]
 
 
 def test_run_dataset_contract_stops_when_doctor_is_blocked(tmp_path: Path, monkeypatch) -> None:

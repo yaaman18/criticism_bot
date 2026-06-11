@@ -105,6 +105,10 @@ For the current ERIE-on-Lenia implementation, the minimal world components are:
 These do not merely decorate the scene. They define whether action differences
 matter.
 
+Legacy `resource / hazard / shelter` wording is compatibility language only.
+New data contracts and analysis should prefer the canonical external-state
+names above.
+
 ### MUST
 
 - Energy-rich regions MUST not be globally safe.

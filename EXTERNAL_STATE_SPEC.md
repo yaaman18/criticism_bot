@@ -126,9 +126,16 @@ training pipelines.
 That means:
 
 - existing `env_channels` may remain as a compatibility output
-- legacy property access such as `energy_gradient` may remain
+- legacy property access such as `resource`, `hazard`, and `shelter` may remain
 - `ExternalState` should initially be added as an explicit internal container
   rather than by removing old APIs
+
+The canonical names are `energy_gradient`, `thermal_stress`, `toxicity`,
+`niche_stability`, and `flow`. The legacy names map as:
+
+- `resource` -> `energy_gradient`
+- `hazard` -> `0.6 * thermal_stress + 0.4 * toxicity`
+- `shelter` -> `niche_stability`
 
 ## 8. Transport Extension
 

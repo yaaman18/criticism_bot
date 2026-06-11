@@ -2,24 +2,32 @@
 
 openFrameworks + GLSL で ERIE/Lenia runtime を生命体っぽく描画するための最小 viewer です。
 
-## 前提
+## 最短セットアップ
 
 - openFrameworks 0.12 以降
-- 先に runtime `.npz` から frame export を作ること
+- `openframeworks/erie_life_viewer/config.make` の `OF_ROOT` がローカル環境に合っていること
 
 ```bash
-python3 -m trm_pipeline.export_erie_openframeworks_frames \
-  --npz artifacts/lenia_runtime_check/erie_20260318_seed_000510.npz \
-  --output-root artifacts/of_viewer_export_smoke
+./scripts/prepare_erie_life_viewer.sh \
+  --npz artifacts/multispecies_runtime_check/erie_20260404_seed_000215.npz
 ```
 
-## openFrameworks project の作り方
+これで以下を一括実行します。
 
-1. Project Generator で新しい empty app をこのディレクトリに作る  
-   `openframeworks/erie_life_viewer`
-2. 生成後、`src/` と `bin/data/shaders/` をこのディレクトリの内容で上書きする
-3. export 済みデータを `bin/data/session/` にコピーする  
-   `manifest.json` と `frames/*.png`
+- `.npz` から viewer 用 `manifest.json` / `frames/*.png` を export
+- `bin/data/session/` へ同期
+- `make` で viewer を build
+
+起動:
+
+```bash
+make -C openframeworks/erie_life_viewer RunRelease
+```
+
+## Project Generator UI の補足
+
+Project Generator を使う場合、`Project path` と `Template` は上部の `create / update` タブにあります。  
+右上ギアの `settings` タブには `openFrameworks path` / `Platform` / `Version` しか表示されません。
 
 期待する構成:
 

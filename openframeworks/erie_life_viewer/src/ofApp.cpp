@@ -7,10 +7,11 @@ std::string joinPath(const std::string& left, const std::string& right) {
 }
 
 void ofApp::setup() {
-    ofDisableArbTex();
+    ofEnableArbTex();
     ofSetFrameRate(60);
     ofBackground(4, 3, 7);
     quad_.set(ofGetWidth(), ofGetHeight(), 2, 2);
+    quad_.setPosition(ofGetWidth() * 0.5f, ofGetHeight() * 0.5f, 0.0f);
     shader_.load("shaders/life.vert", "shaders/life.frag");
 
     const auto defaultManifest = ofToDataPath("session/manifest.json", true);
@@ -66,6 +67,10 @@ void ofApp::keyPressed(int key) {
         pulseStrength_ = std::max(0.0f, pulseStrength_ - 0.03f);
     } else if (key == '4') {
         pulseStrength_ = std::min(0.8f, pulseStrength_ + 0.03f);
+    } else if (key == '5') {
+        exposure_ = std::max(0.20f, exposure_ - 0.05f);
+    } else if (key == '6') {
+        exposure_ = std::min(3.00f, exposure_ + 0.05f);
     } else if (key == 'f') {
         ofToggleFullscreen();
     } else if (key == 'r' && !sessionManifest_.empty()) {
@@ -73,7 +78,7 @@ void ofApp::keyPressed(int key) {
     }
 }
 
-bool ofApp::loadSession(const ofFilePath& manifestPath) {
+bool ofApp::loadSession(const std::string& manifestPath) {
     ofFile file(manifestPath);
     if (!file.exists()) {
         return false;
@@ -120,6 +125,7 @@ bool ofApp::loadFrame(std::size_t frameIndex) {
     current_.field = field.getTexture();
     current_.body = body.getTexture();
     current_.aura = aura.getTexture();
+    quad_.mapTexCoordsFromTexture(current_.life);
     return true;
 }
 
@@ -145,8 +151,10 @@ void ofApp::drawHud() const {
         "[ ] speed\n"
         "1/2 overlay\n"
         "3/4 pulse\n"
+        "5/6 exposure\n"
         "r reload\n"
         "frame: " + ofToString(frameIndex_) + "/" + ofToString(std::max<std::size_t>(1, frames_.size()) - 1) + "\n"
+        "exp: " + ofToString(exposure_, 2) + "\n"
         "fps: " + ofToString(ofGetFrameRate(), 1),
         24,
         28,

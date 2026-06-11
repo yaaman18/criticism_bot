@@ -431,6 +431,24 @@
   - `episode_id`
   - `t`
   - `lenia_params`
+- passive Lenia rollout summary には `parameter_search` を持たせること。
+  - `curator_version`
+  - center / wide `mu/sigma` range
+  - center sampling ratio
+  - seed ごとの最大試行回数
+  - attempted / rejected parameter set count
+  - rejection reason count
+- ERIE-on-Lenia agentic manifest には以下を持たせること。
+  - `environment_config_canonical`
+  - `external_state_contact`
+  - `intervention_summary`
+- ERIE-on-Lenia agentic `.npz` には action-conditioned transition として以下を保存すること。
+  - `intervention_action_onehot`
+  - `intervention_contact_state`
+  - `intervention_next_contact_state`
+  - `intervention_contact_delta`
+  - `intervention_species_contact_delta`
+  - `intervention_viability_delta`
 
 ### SHOULD
 
@@ -1139,8 +1157,8 @@ dead_t = 1 if c_dead >= k_irrev else 0
 - 初期 action space の意味は少なくとも以下で固定してよい。
 
 ```text
-approach: resource contact を増やすが hazard exposure も増えうる
-withdraw: hazard exposure を減らすが resource access も下がりうる
+approach: energy_gradient contact を増やすが thermal_stress / toxicity exposure も増えうる
+withdraw: thermal_stress / toxicity exposure を減らすが energy_gradient access も下がりうる
 intake: G_t 回復効率を上げるが B_t leakage risk を増やしうる
 seal: B_t を回復または保護するが intake efficiency を下げうる
 reconfigure: 境界形状または gate 配分を変えるが短期コストを持つ
@@ -1215,7 +1233,7 @@ dead_t = death(v_{t+1})
 - `adaptive agency` の初期 proxy として、`closed-loop` が `no-action` と `random-action` より良い viability を達成することを用いてよい。
 - `Lenia` の環境評価では、少なくとも以下を補助条件として使ってよい。
   - 安定領域とカオス領域の両方を含むこと
-  - 資源 / hazard / shelter に相当する非一様性を含められること
+  - `energy_gradient / thermal_stress / toxicity / niche_stability / flow` による非一様性を含められること
   - 境界維持と行為選択を学ぶ余地があること
 
 ---
@@ -1249,14 +1267,24 @@ dead_t = death(v_{t+1})
   - `mean_homeostatic_error`
   - `survival_fraction`
   - `mean_policy_entropy`
-  - `mean_contact_resource`
-  - `mean_contact_hazard`
-  - `mean_contact_shelter`
+  - `mean_contact_energy`
+  - `mean_contact_thermal`
+  - `mean_contact_toxicity`
+  - `mean_contact_niche`
+  - `mean_contact_resource` 互換 alias
+  - `mean_contact_hazard` 互換 alias
+  - `mean_contact_shelter` 互換 alias
   - `action_diversity`
 - `closed-loop` の理想挙動は、少なくとも一部の seed で `approach`, `withdraw`, `reconfigure` のいずれかが `intake`, `seal` 以外に実際に出現することを補助条件として使ってよい。
 - `policy_entropy` は、中程度の exploratory capacity を示す補助指標として用いてよいが、単独で理想挙動の十分条件にしてはならないこと。
-- `resource` が遠方、`hazard` が近傍、`shelter` が偏在する条件では、`closed-loop` が接触対象と行為分布を変えることを理想挙動の補助条件として用いてよい。
+- `energy_gradient` が遠方、`thermal_stress / toxicity` が近傍、`niche_stability` が偏在する条件では、`closed-loop` が接触対象と行為分布を変えることを理想挙動の補助条件として用いてよい。
 - 初期 runtime では、`G_target`, `B_target` の近傍に留まりつつ `final_homeostatic_error` と `mean_homeostatic_error` を baseline より改善することを、理想挙動への近似条件として扱ってよい。
+
+互換性のため、古い出力や CLI に残る次の語は alias として扱う。
+
+- `resource` -> `energy_gradient`
+- `hazard` -> `0.6 * thermal_stress + 0.4 * toxicity`
+- `shelter` -> `niche_stability`
 
 ---
 
@@ -1289,7 +1317,7 @@ dead_t = death(v_{t+1})
 #### 40.4 Environment
 
 - 環境を reward / punishment source のみとして扱っていないか確認すること。
-- 少なくとも `resource`, `hazard`, `shelter` またはそれに相当する非一様環境条件があるか確認すること。
+- 少なくとも `energy_gradient`, `thermal_stress`, `toxicity`, `niche_stability`, `flow` またはそれに相当する非一様環境条件があるか確認すること。
 - 環境が ERIE の自己維持にとって必要条件として機能しているか確認すること。
 
 #### 40.5 Viability
@@ -1310,7 +1338,7 @@ dead_t = death(v_{t+1})
 
 - operational closure の proxy を示さずに `autopoietic` と主張していないか確認すること。
 - Markov blanket をそのまま metaphysical self の証明に使っていないか確認すること。
-- `boundary maintenance`, `resource uptake`, `repair loop` の少なくとも 2 つ以上が runtime で閉じているか確認すること。
+- `boundary maintenance`, `energy uptake`, `repair loop` の少なくとも 2 つ以上が runtime で閉じているか確認すること。
 
 #### 40.8 GNW Scope
 
@@ -1361,7 +1389,7 @@ dead_t = death(v_{t+1})
 - 初期導入では、古細菌データを少なくとも以下の設計変数の根拠に使ってよい。
   - `G_t`: 利用可能エネルギーまたは非平衡勾配の proxy
   - `B_t`: 境界完全性または膜維持の proxy
-  - `resource / hazard / shelter` 環境場の具体化
+  - `energy_gradient / thermal_stress / toxicity / niche_stability / flow` 外部状態場の具体化
 - 初期導入では、古細菌データを `TRM-Vm` の補助 prior または補助検証セットとして使ってよい。
 - 初期導入では、古細菌データを `TRM-As` の主教師にしてはならないが、行為の評価条件を設計するための生態学的参照として使ってよい。
 - 古細菌データは、少なくとも以下の 3 類型に分けて整理してよい。
@@ -1378,7 +1406,7 @@ dead_t = death(v_{t+1})
 - Phase 0 の目的は、以下の設計を現実生態に照らして補強すること。
   - viability variable
   - death criterion
-  - resource / hazard / shelter の意味
+  - `energy_gradient / thermal_stress / toxicity / niche_stability / flow` の意味
   - environment への依存性
 - Phase 0 の成果物として、少なくとも以下を作成してよい。
   - `古細菌データ -> ERIE 設計変数` 対応表
@@ -1483,7 +1511,7 @@ Purpose:
 Primary source:
 
 - ERIE runtime rollouts on top of Lenia
-- `resource / hazard / shelter` fields
+- `energy_gradient / thermal_stress / toxicity / niche_stability / flow` external-state fields
 - analytic or assistive teacher traces
 
 Primary retained unit:

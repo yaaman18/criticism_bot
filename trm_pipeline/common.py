@@ -120,16 +120,20 @@ def activity_summary(arr: np.ndarray) -> dict[str, float]:
     }
 
 
-def reject_scalar_episode(summary: dict[str, float]) -> bool:
+def reject_scalar_episode_reason(summary: dict[str, float]) -> str | None:
     if summary["mass"] < 1e-2:
-        return True
+        return "empty_mass"
     if summary["mean"] < 5e-4:
-        return True
+        return "low_mean"
     if summary["mean"] > 0.95:
-        return True
+        return "saturated_mean"
     if summary["std"] < 1e-4:
-        return True
-    return False
+        return "static_std"
+    return None
+
+
+def reject_scalar_episode(summary: dict[str, float]) -> bool:
+    return reject_scalar_episode_reason(summary) is not None
 
 
 def first_halt_step(probs: np.ndarray, threshold: float) -> int:
